@@ -503,8 +503,29 @@ int mtl_gpu_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_
     static _Thread_local int hint = -1; static _Thread_local uint64_t hint_gen, hint_addr, hint_len;
     return mtl_gpu_addr_impl(addr, len, buf, off, gpu, &hint, &hint_gen, &hint_addr, &hint_len);
 }
-static int mtl_gpu_addr_cached(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_t *gpu, int *hint, uint64_t *hint_gen, uint64_t *hint_addr, uint64_t *hint_len) {
-    return mtl_gpu_addr_impl(addr, len, buf, off, gpu, hint, hint_gen, hint_addr, hint_len);
+// Opt-in sampled CPU timings; disabled on normal gameplay, one measurement per 128 calls.
+static uint64_t bp_now(void);
+static int cpu_sample_on(void) { static int enabled = -1; if (enabled < 0) enabled = getenv("DM_NVN_CPU_SAMPLE") != NULL; return enabled; }
+static uint64_t g_cpu_vbuf_calls, g_cpu_vbuf_samples, g_cpu_vbuf_ns;
+static uint64_t g_cpu_arg_calls, g_cpu_arg_samples, g_cpu_arg_ns;
+// Resolve all vertex streams under one pool lock per draw, rather than one lock per stream.
+// Preserve first-match pool precedence, per-slot generation hints and pool_res residency.
+static void mtl_vbuf_batch(const uint64_t addr[16], uint64_t gpu[16], uint16_t *valid,
+                           int hint[16], uint64_t hint_gen[16], uint64_t hint_addr[16], uint64_t hint_len[16]) {
+    *valid = 0;
+    int sampled = cpu_sample_on() && ((++g_cpu_vbuf_calls & 127u) == 0);
+    uint64_t sample_start = sampled ? bp_now() : 0;
+    pthread_mutex_lock(&g_mu);
+    for (int s = 0; s < 16; s++) {
+        if (!addr[s]) continue;
+        int i = mtl_pool_find_locked(addr[s], 1, &hint[s], &hint_gen[s], &hint_addr[s], &hint_len[s]);
+        if (i < 0) continue;
+        pool_res(i);
+        gpu[s] = g_pools[i].gpu + addr[s] - g_pools[i].base;
+        *valid |= (uint16_t)(1u << s);
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (sampled) { g_cpu_vbuf_ns += bp_now() - sample_start; g_cpu_vbuf_samples++; }
 }
 
 // ---------- 提交 ----------
@@ -1571,7 +1592,8 @@ static int passdump(void) {
     if (g_rr_checking) return 0;
 #endif
     static long a0 = -2, a1; if (a0 == -2) { const char *e = getenv("DM_NVN_PASSDUMP"); a0 = e ? atol(e) : -1; a1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : a0; }
-    long f = (long)atomic_load(&g_cur_frame); return a0 >= 0 && f >= a0 && f <= a1;
+    if (a0 < 0) return 0; // Disabled in normal runs: avoid per-operation atomic frame loads.
+    long f = (long)atomic_load(&g_cur_frame); return f >= a0 && f <= a1;
 }
 #define PD(...) do { if (passdump()) { fprintf(stderr, "[pass] F%llu ", (unsigned long long)atomic_load(&g_cur_frame)); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 static void blit_note(void) { if (g_enc) PD("E %llu 拷贝 / 缓冲更新结束渲染通道", g_stat_pass); }
@@ -1600,6 +1622,7 @@ static void use_tick(void) {   // 每次出图调用 | Called on every present
         if (e) { g_use_f = fopen(e, "w"); if (!g_use_f) { MLOG("【红】DM_GFXUSE 打不开 %s", e); return; }
             fprintf(g_use_f, "kind\tguest_addr\tlen\tfirst_frame\ttex_id\tfmt\twxh\n"); fflush(g_use_f); g_use = USE_WAIT; atexit(use_exit);
             MLOG("[gfxuse] 等面板事件：首次 OpenPanel MainMenuButtonRibbon 后 1 秒起记 %d 帧 → %s", USE_FRAMES, e); } }
+    if (g_use == USE_OFF || g_use == USE_DONE) return;
     long f = (long)atomic_load(&g_cur_frame);
     if (g_use == USE_WAIT) {
         uint64_t t = dm_prof_ribbon_ns();
@@ -2837,16 +2860,24 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (cached) return cached;
     id<MTLRenderPipelineState> ps;
     NSError *e = nil; uint64_t bt = bp_now();
-    ps = g_pso_lmap ? nil : pso_pend_take(&k);
+    int specialized = g_pso_lmap != NULL;
+    ps = specialized ? nil : pso_pend_take(&k);
     if (ps) g_pp_taken++;
     else {
         if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; pso_predict_rest(); }   // 本次提交第一次缺：先把后面的丢出去并行编，再同步编眼前这条 | First miss in this submission: first kick the later ones out to compile in parallel, then synchronously compile the one at hand
         MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, g_pso_fsfn, g_pso_lmap != NULL);
         ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
     }
-    g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
+    uint64_t build_ns = bp_now() - bt;
+    g_bp_pso_n++; g_bp_pso_ns += build_ns;
     if (!ps) { MLOG("【红】建渲染管线失败：%s", e.localizedDescription.UTF8String); return nil; }
-    pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&k, vs, fs, g_pso_lmap != NULL, g_pso_lmap ? &g_pso_fz : NULL, &sk); pso_skey_hex(&sk, shex);
+    pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&k, vs, fs, specialized, specialized ? &g_pso_fz : NULL, &sk); pso_skey_hex(&sk, shex);
+    // Slow runtime misses must be linkable to the exact recorded PSO key and warm-up outcome.
+    // No per-draw logging: emit only for a newly built pipeline taking >=10 ms.
+    if (build_ns >= 10000000ull)
+        MLOG("[pso-miss] %.1f ms special=%d pending=%d warm_running=%d claimed=%llu/%llu key=%s",
+             build_ns / 1e6, specialized, !specialized && g_pp_submit_mark == g_sub_serial,
+             atomic_load(&g_warm_running), g_warm_claim_rps, g_warm_rps, shex);
     pso_record("R\t%s\n", shex);
     pso_user_record("R\t%s\n", shex);
     hm_put_id(&g_pso, &k, ps);
@@ -3096,11 +3127,15 @@ static inline int m3_use_seen(void *p, uint32_t u) {
 #endif
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
     if (!sh->ae) return 1;
+    int sampled = cpu_sample_on() && ((++g_cpu_arg_calls & 127u) == 0);
+    uint64_t sample_start = sampled ? bp_now() : 0;
     uint64_t slots[NVN_REFL_MAXB] = {0};
     args_sync_dirty();
-    if (!passdump() && !g_args_dirty[nvn_stage] && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5) {
+    const int dumping = passdump(); // Keep one diagnostic decision for this argument encoding.
+    if (!dumping && !g_args_dirty[nvn_stage] && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5) {
         bind_args(en, nvn_stage, metal_vertex, sh->ab_buf, sh->ab_gpu, sh->ab_off, sh->rf.abi);
         g_stat_args_reuse++;
+        if (sampled) { g_cpu_arg_ns += bp_now() - sample_start; g_cpu_arg_samples++; }
         return 1;
     }
 #if DM_NVN_M3
@@ -3118,7 +3153,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     // DM_NVN_PASSDUMP：每通道每阶段第一次新编时记着色器键（K）与各绑定的实际来源（B：UBO 地址 / 长度 / 前 4 个浮点，贴图号与序号或「哑」）
     // DM_NVN_PASSDUMP: on the first new encode per pass per stage, records the shader key (K) and the actual source of each binding (B: UBO address / length / first 4 floats, texture ID and serial, or 「哑」(dummy))
     static uint64_t bl_pass[6]; static int bl_all = -1; if (bl_all < 0) bl_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;   // 每次新编都记（否则只记每通道每阶段第一次） | Record on every new encode (otherwise only the first time per pass per stage)
-    int bl = passdump() && (bl_all || bl_pass[nvn_stage] != g_stat_pass);
+    int bl = dumping && (bl_all || bl_pass[nvn_stage] != g_stat_pass);
     if (bl) { bl_pass[nvn_stage] = g_stat_pass; PD("K %llu st%d key=%s nb=%d", g_stat_pass, nvn_stage, sh->key[0] ? sh->key : sh->builtin ? sh->builtin : "?", sh->rf.nb); }
     pthread_mutex_lock(&g_rmu);   // 贴图 / 采样器登记表可能正被游戏线程扩容或改写 | The texture / sampler registration tables may be being grown or rewritten by the game thread
     for (int i = 0; i < sh->rf.nb; i++) {
@@ -3154,7 +3189,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             int tid = reg < 128 ? (int)(S.tex[nvn_stage][reg] & 0xfffff) : 0;
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
             if (t && tid < g_ntreg) use_rec("tex", (uint64_t)g_treg[tid].t.mem, g_treg[tid].t.L.size, tid, &g_treg[tid].t);
-            if (t && passdump() && tid < g_ntreg) PD("R %llu st%d ser=%llu", g_stat_pass, nvn_stage, g_treg[tid].t.serial);
+            if (t && dumping && tid < g_ntreg) PD("R %llu st%d ser=%llu", g_stat_pass, nvn_stage, g_treg[tid].t.serial);
             if (bl) PD("B %llu st%d tex reg%d tid=%d %s ser=%llu fmt=%lu %lux%lux%lu view_lv=%lu+%lu view_sl=%lu array=%lu target=%lu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull,
                        (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth,
                        (unsigned long)(t.parentTexture ? t.parentRelativeLevel : 0), (unsigned long)t.mipmapLevelCount,
@@ -3165,7 +3200,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         } else if (b->kind == NVN_RB_IMG) {   // 可写贴图：NVN 图像槽 r（BindImages）↔ D3D u_r | Writable texture: NVN image slot r (BindImages) ↔ D3D u_r
             int tid = reg < 32 ? (int)(S.img[nvn_stage][reg] & 0xfffff) : 0;
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
-            if (passdump()) PD("W %llu st%d reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
+            if (dumping) PD("W %llu st%d reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
             if (t && !(t.usage & MTLTextureUsageShaderWrite)) { RED_ONCE(32, "图像槽绑的贴图没有可写用途（贴图号 %d）", tid); t = nil; }
             if (!t) { t = dummy_img(b->dtt, b->dpf); trid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }   // 未绑：D3D 语义写入丢弃——写进专用哑贴图，不污染读出 0 的那套 | Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
             slots[aid] = trid;
@@ -3221,6 +3256,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     bind_args(en, nvn_stage, metal_vertex, ab, g_cur_arena->gpu + off, off, sh->rf.abi);
     sh->ab_buf = ab; sh->ab_gpu = g_cur_arena->gpu + off; sh->ab_off = off; sh->ab_pass = g_pass.serial; g_args_dirty[nvn_stage] = 0;
     g_stat_args_enc++;
+    if (sampled) { g_cpu_arg_ns += bp_now() - sample_start; g_cpu_arg_samples++; }
     return 1;
 }
 static id<MTLBuffer> g_quad_ib; static uint64_t g_quad_gpu;
@@ -4839,11 +4875,12 @@ frz_plain:;
     FX_SET(6, !memcmp(g_enc_fx.bc, S.blend_color, sizeof g_enc_fx.bc), memcpy(g_enc_fx.bc, S.blend_color, sizeof g_enc_fx.bc), enc_r_blend_color(en, S.blend_color[0], S.blend_color[1], S.blend_color[2], S.blend_color[3]));
     #undef FX_SET
     static _Thread_local int vb_pool_hint[16] = {-1}; static _Thread_local uint64_t vb_pool_gen[16], vb_pool_addr[16], vb_pool_len[16];
-    for (int s_ = 0; s_ < 16; s_++) {
-        if (!S.vbuf[s_].address) continue;
-        void *mb; uint64_t mo;
-        uint64_t gpu;
-        if (mtl_gpu_addr_cached(S.vbuf[s_].address, 1, &mb, &mo, &gpu, &vb_pool_hint[s_], &vb_pool_gen[s_], &vb_pool_addr[s_], &vb_pool_len[s_])) { vbuf_bind_once(en, 16 + s_, gpu); use_rec("buf", S.vbuf[s_].address, S.vbuf[s_].size, 0, NULL); }
+    uint64_t vb_addr[16], vb_gpu[16] = {0}; uint16_t vb_valid = 0;
+    for (int s_ = 0; s_ < 16; s_++) vb_addr[s_] = S.vbuf[s_].address;
+    mtl_vbuf_batch(vb_addr, vb_gpu, &vb_valid, vb_pool_hint, vb_pool_gen, vb_pool_addr, vb_pool_len);
+    for (int s_ = 0; s_ < 16; s_++) if (vb_valid & (1u << s_)) {
+        vbuf_bind_once(en, 16 + s_, vb_gpu[s_]);
+        use_rec("buf", vb_addr[s_], S.vbuf[s_].size, 0, NULL);
     }
     static id<MTLBuffer> zero; if (!zero) { zero = [g_dev newBufferWithLength:64 options:MTLResourceStorageModeShared]; res_add(zero); }
     static uint64_t zero_gpu; if (!zero_gpu) zero_gpu = zero.gpuAddress;
@@ -6146,6 +6183,10 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
     g_present_n++;
     if (g_use != USE_OFF && g_use != USE_DONE) use_tick();
+    if (cpu_sample_on() && g_present_n % 120 == 0)
+        MLOG("[cpu-sample] present=%llu vbuf_n=%llu vbuf_avg_us=%.2f args_n=%llu args_avg_us=%.2f (1/128 calls, lock included)",
+             g_present_n, g_cpu_vbuf_samples, g_cpu_vbuf_samples ? (double)g_cpu_vbuf_ns / g_cpu_vbuf_samples / 1000.0 : 0,
+             g_cpu_arg_samples, g_cpu_arg_samples ? (double)g_cpu_arg_ns / g_cpu_arg_samples / 1000.0 : 0);
     if (bootprof() && (g_present_n == 1 || g_present_n % 120 == 0)) {
         if (g_present_n == 1) g_bp_first_present = bp_now() - g_bp_t0;
         MLOG("[bootprof] t=%.3f s 出图第 %llu 次：metallib 载入 %llu 个 / %.1f ms；管线创建 %llu 个 / %.1f ms（均在提交线程同步）；预热领用 着色器 %llu / 渲染管线 %llu / 计算管线 %llu；"
