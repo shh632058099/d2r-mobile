@@ -1,0 +1,137 @@
+name: Prepare iOS input
+on:
+  workflow_dispatch:
+    inputs:
+      output_repository:
+        description: Private repository for prepared game-derived build inputs (OWNER/REPO)
+        type: string
+        required: true
+      source_repository:
+        description: Source repository or fork
+        type: string
+        default: shh632058099/d2r-mobile
+      source_ref:
+        description: Branch, tag or commit to prepare
+        type: string
+        default: main
+  workflow_call:
+    inputs:
+      output_repository:
+        description: Private repository for prepared game-derived build inputs
+        type: string
+        required: true
+      source_repository:
+        type: string
+        default: shh632058099/d2r-mobile
+      source_ref:
+        type: string
+        default: main
+    secrets:
+      BUILD_TOKEN:
+        required: true
+      GAME_ARCHIVE:
+        required: true
+      LEGACY_METADATA:
+        required: true
+      SOURCE_TOKEN:
+        required: false
+permissions:
+  contents: read
+concurrency:
+  group: d2r-ios-prepare
+  queue: max
+  cancel-in-progress: false
+jobs:
+  ios:
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+      OUTPUT_REPOSITORY: ${{ inputs.output_repository }}
+      GH_TOKEN: ${{ secrets.BUILD_TOKEN }}
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+      PYTHONUTF8: '1'
+      J: '3'
+    steps:
+      - name: Verify private output repository
+        env:
+          OUTPUT_REPOSITORY: ${{ inputs.output_repository }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$OUTPUT_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::output_repository must be OWNER/REPO."
+            exit 1
+          fi
+          is_private="$(gh api "repos/$OUTPUT_REPOSITORY" --jq '.private')"
+          if [[ "$is_private" != "true" ]]; then
+            echo "::error::The output repository must be private. Game-derived prepared inputs must not be stored in this public source repository."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Select the latest release or requested source
+        id: source
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN || github.token }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: python3 scripts/source/resolve.py
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.source_repository }}
+          token: ${{ secrets.SOURCE_TOKEN || github.token }}
+          ref: ${{ steps.source.outputs.ref }}
+          fetch-depth: 0
+          path: upstream
+          persist-credentials: false
+      - name: Record the selected source and build identity
+        run: python3 scripts/source/configure.py
+      - name: Select the Apple toolchain
+        id: xcode
+        run: python3 scripts/source/select_xcode.py
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install the archive downloader
+        run: python -m pip install -r requirements.txt
+      - name: Resolve input and preparation identity
+        id: plan
+        env:
+          GAME_ARCHIVE: ${{ secrets.GAME_ARCHIVE }}
+          IOS_TOOLCHAIN: ${{ steps.xcode.outputs.toolchain }}
+          LEGACY_METADATA: ${{ secrets.LEGACY_METADATA }}
+        run: python scripts/source/prepare_ios.py plan
+      - name: Verify the original archive or download it
+        env:
+          GAME_ARCHIVE: ${{ secrets.GAME_ARCHIVE }}
+          INPUT_REVISION: ${{ steps.plan.outputs.input_revision }}
+        run: python scripts/source/prepare_ios.py download
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+      - name: Install upstream generation tools
+        run: |
+          for tool in xcodegen spirv-cross; do
+            brew list "$tool" >/dev/null 2>&1 || brew install "$tool"
+          done
+          xcrun --sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+          df -h .
+      - name: Prepare game programs, iOS overlays and Metal libraries
+        env:
+          GAME_ARCHIVE: ${{ secrets.GAME_ARCHIVE }}
+          GAME_REVISION: ${{ steps.plan.outputs.input_revision }}
+          LEGACY_REVISION: ${{ steps.plan.outputs.legacy_revision }}
+          LEGACY_METADATA: ${{ secrets.LEGACY_METADATA }}
+          TOOLS_COMMIT: ${{ github.sha }}
+          IOS_PREPARED_KEY: ${{ steps.plan.outputs.prepared_key }}
+          IOS_TOOLCHAIN: ${{ steps.xcode.outputs.toolchain }}
+        run: python scripts/source/prepare_ios.py prepare
+      - name: Export the iOS prepared package to the private output repository
+        env:
+          IOS_PREPARED_KEY: ${{ steps.plan.outputs.prepared_key }}
+        run: python scripts/source/prepare_ios.py export

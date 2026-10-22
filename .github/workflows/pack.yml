@@ -1,0 +1,223 @@
+name: Build IPA (private output)
+on:
+  workflow_call:
+    inputs:
+      prepared_input:
+        description: Prepared package configuration as JSON
+        type: string
+        required: true
+      output_repository:
+        description: Private repository that stores generated build assets
+        type: string
+        required: true
+      source_repository:
+        type: string
+        default: shh632058099/d2r-mobile
+      source_ref:
+        type: string
+        default: main
+    secrets:
+      BUILD_TOKEN:
+        required: true
+      SOURCE_TOKEN:
+        required: false
+permissions:
+  contents: read
+concurrency:
+  group: d2r-build-${{ inputs.output_repository }}
+  queue: max
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      input_revision: ${{ steps.input.outputs.input_revision }}
+    env:
+      SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+      OUTPUT_REPOSITORY: ${{ inputs.output_repository }}
+      GH_TOKEN: ${{ secrets.BUILD_TOKEN }}
+    steps:
+      - name: Verify private output repository
+        env:
+          OUTPUT_REPOSITORY: ${{ inputs.output_repository }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$OUTPUT_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::output_repository must be OWNER/REPO."
+            exit 1
+          fi
+          is_private="$(gh api "repos/$OUTPUT_REPOSITORY" --jq '.private')"
+          if [[ "$is_private" != "true" ]]; then
+            echo "::error::The output repository must be private. Generated game-derived files must not be stored in this public source repository."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Select the latest release or requested source
+        id: source
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN || github.token }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: python3 scripts/source/resolve.py
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.source_repository }}
+          token: ${{ secrets.SOURCE_TOKEN || github.token }}
+          ref: ${{ steps.source.outputs.ref }}
+          fetch-depth: 0
+          path: upstream
+          persist-credentials: false
+      - name: Record the selected source and build identity
+        run: python3 scripts/source/configure.py
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install the input downloader
+        run: python -m pip install -r requirements.txt pillow==12.1.1 numpy==2.4.4
+      - name: Resolve the prepared package checksum
+        id: input
+        env:
+          PREPARED_INPUT: ${{ inputs.prepared_input }}
+        run: python scripts/source/prepared.py resolve
+      - name: Download and verify the prepared package
+        env:
+          PREPARED_INPUT: ${{ inputs.prepared_input }}
+          INPUT_REVISION: ${{ steps.input.outputs.input_revision }}
+        run: python scripts/source/prepared.py download
+      - name: Prepare the upstream PNG compressor
+        run: bash scripts/png_backend.sh
+      - name: Verify compatibility and prepare current native sources
+        env:
+          LD_PRELOAD: ${{ github.workspace }}/.tools/png-zlib-ng-2.3.2/lib/libz.so.1
+          TOOLS_COMMIT: ${{ github.sha }}
+          INPUT_REVISION: ${{ steps.input.outputs.input_revision }}
+        run: python scripts/source/prepared.py prepare
+      - name: Store verified native inputs in the private output repository
+        env:
+          OUTPUT_REPOSITORY: ${{ inputs.output_repository }}
+          BUILD_TAG: ci-input-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          gh release create "$BUILD_TAG" \
+            outputs/native-inputs.tar.gz \
+            outputs/source-payload.zip \
+            outputs/source-input-report.json \
+            outputs/build-context.json \
+            --repo "$OUTPUT_REPOSITORY" \
+            --title "Temporary D2R build inputs ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" \
+            --notes "Private temporary build inputs; removed after this workflow completes."
+  native:
+    needs: prepare
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    runs-on: macos-26
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        minimum: ['26.0', '18.0']
+    env:
+      INPUT_REVISION: ${{ needs.prepare.outputs.input_revision }}
+      GH_TOKEN: ${{ secrets.BUILD_TOKEN }}
+      OUTPUT_REPOSITORY: ${{ inputs.output_repository }}
+      BUILD_TAG: ci-input-${{ github.run_id }}-${{ github.run_attempt }}
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download verified native inputs from the private repository
+        run: |
+          set -euo pipefail
+          mkdir -p outputs
+          gh release download "$BUILD_TAG" --repo "$OUTPUT_REPOSITORY" --dir outputs \
+            --pattern 'native-inputs.tar.gz' \
+            --pattern 'source-payload.zip' \
+            --pattern 'source-input-report.json' \
+            --pattern 'build-context.json'
+      - name: Select macOS 26 and iOS 26.4+ SDK
+        id: xcode
+        run: python3 scripts/source/select_xcode.py
+      - name: Prepare native build dependencies
+        run: |
+          brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+          python3 -m venv .venv
+          .venv/bin/pip install PyYAML==6.0.2
+          tar -xzf outputs/native-inputs.tar.gz
+      - name: Compile and verify the IPA
+        env:
+          MINIMUM_IOS: ${{ matrix.minimum }}
+          NATIVE_MODULE_CACHE_HIT: 'false'
+        run: |
+          set -o pipefail
+          .venv/bin/python scripts/source/build.py "$MINIMUM_IOS" 2>&1 | tee outputs/native-build.log
+      - name: Store verified IPA in the private output repository
+        env:
+          MINIMUM_IOS: ${{ matrix.minimum }}
+        run: |
+          set -euo pipefail
+          if [[ "$MINIMUM_IOS" == "18.0" ]]; then
+            report=outputs/source-ios18-report.json
+          else
+            report=outputs/source-report.json
+          fi
+          shopt -s nullglob
+          ipas=(outputs/D2RMobile-*.ipa)
+          if [[ ${#ipas[@]} -ne 1 || ! -f "$report" ]]; then
+            echo "::error::Expected exactly one IPA and its build report."
+            exit 1
+          fi
+          gh release upload "$BUILD_TAG" "${ipas[0]}" "$report" \
+            --repo "$OUTPUT_REPOSITORY" --clobber
+  publish:
+    needs: [prepare, native]
+    if: ${{ !cancelled() && needs.native.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      INPUT_REVISION: ${{ needs.prepare.outputs.input_revision }}
+      OUTPUT_REPOSITORY: ${{ inputs.output_repository }}
+      BUILD_TAG: ci-input-${{ github.run_id }}-${{ github.run_attempt }}
+      SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+      GH_TOKEN: ${{ secrets.BUILD_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download verified IPA files from the private repository
+        run: |
+          set -euo pipefail
+          mkdir -p outputs
+          gh release download "$BUILD_TAG" --repo "$OUTPUT_REPOSITORY" --dir outputs
+      - name: Publish verified IPA to the private output repository
+        run: |
+          python3 scripts/source/publish.py
+
+  cleanup:
+    if: always()
+    needs: [prepare, native, publish]
+    runs-on: ubuntu-24.04
+    env:
+      OUTPUT_REPOSITORY: ${{ inputs.output_repository }}
+      BUILD_TAG: ci-input-${{ github.run_id }}-${{ github.run_attempt }}
+      GH_TOKEN: ${{ secrets.BUILD_TOKEN }}
+    steps:
+      - name: Delete temporary private build assets
+        run: |
+          set -euo pipefail
+          if [[ ! "$OUTPUT_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            exit 0
+          fi
+          is_private="$(gh api "repos/$OUTPUT_REPOSITORY" --jq '.private' 2>/dev/null || true)"
+          if [[ "$is_private" != "true" ]]; then
+            exit 0
+          fi
+          if gh release view "$BUILD_TAG" --repo "$OUTPUT_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$BUILD_TAG" --repo "$OUTPUT_REPOSITORY" --cleanup-tag --yes
+          fi
