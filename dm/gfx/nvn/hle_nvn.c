@@ -1150,6 +1150,16 @@ static void tsummary(uint64_t frame) {
         prep_old = p; replay_old = r; commit_old = k;
       } else { prep_old = atomic_load(&g_x_prepare_cpu_ns); replay_old = atomic_load(&g_x_replay_cpu_ns); commit_old = atomic_load(&g_x_commit_cpu_ns); }
       pp = pass; pr = draw; pl = load; pst = store; pfull = full; pf = frame; }
+    { static uint64_t ps, pk, prevf; uint64_t sent, skipped;
+      mtl_vbuf_stats(&sent, &skipped);
+      if (prevf && frame > prevf) {
+          uint64_t changed = sent - ps, avoided = skipped - pk;
+          LOG("[nvn] 顶点绑定 至帧 %llu：每帧 Metal 绑定 %.1f、相同地址省略 %.1f，省略比例 %.1f%%", frame,
+              (double)changed / (frame - prevf), (double)avoided / (frame - prevf),
+              changed + avoided ? 100.0 * avoided / (changed + avoided) : 0.0);
+      }
+      ps = sent; pk = skipped; prevf = frame;
+    }
     { static uint64_t pi, pc, pd, pf; uint64_t ci = atomic_load(&g_cum_sub_instr), cc = atomic_load(&g_cum_sub_cpu_ns), ps_, dr_; mtl_stats(&ps_, &dr_);   // 翻译层 | translation layer
       if (pf && frame > pf && dr_ > pd) LOG("[nvn] 翻译 至帧 %llu：每次绘制 %.0f 条指令，每帧提交 %.2f M 条 / CPU %.3f ms，每帧绘制 %.0f", frame,
           (double)(ci - pi) / (double)(dr_ - pd), (ci - pi) / 1e6 / (double)(frame - pf), (cc - pc) / 1e6 / (double)(frame - pf), (double)(dr_ - pd) / (double)(frame - pf));

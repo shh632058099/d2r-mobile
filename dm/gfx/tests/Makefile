@@ -24,6 +24,13 @@ t_hmap: t_hmap.c ../nvn/nvn_hmap.h
 	clang -O1 -Wall -o $@ t_hmap.c
 t_cover: t_cover.c ../nvn/nvn_cover.h
 	clang -O1 -Wall -o $@ t_cover.c
+t_vbuf_cache: t_vbuf_cache.c ../nvn/nvn_vbuf_cache.h
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -o $@ t_vbuf_cache.c
+
+.PHONY: portable
+portable: t_vbuf_cache
+	./t_vbuf_cache
+
 t_pace: t_pace.c ../nvn/nvn_pace.h
 	clang -O1 -Wall -o $@ t_pace.c
 t_fuse_check: t_fuse_check.m ../../host/crash.c $(GFX) $(GFX_H)
