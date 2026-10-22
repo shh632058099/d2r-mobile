@@ -57,6 +57,7 @@
 #include "nvn_cover.h"
 #include "dmsh_chain.h"   // DMSH_CHAIN：本源码树期望的 B 着色器库翻译链版本 | DMSH_CHAIN: the translation chain version of the B shader library expected by this source tree
 #include "nvn_hmap.h"
+#include "nvn_pool_hint.h"
 #include "../../host/dm.h"
 #import <CommonCrypto/CommonDigest.h>
 #include <stdarg.h>
@@ -423,6 +424,7 @@ uint64_t dm_mtl_l3_sample(uint32_t tick) {
 }
 
 static _Atomic uint64_t g_reg_gen = 1;   // 内存池 / 贴图 / 采样器登记的变更代号：参数缓冲复用以它为失效条件之一 | Change generation of memory pool / texture / sampler registration: one of the invalidation conditions for argument buffer reuse
+static uint64_t g_pool_gen = 1;             // 只在 g_mu 下读写：内存池表变更代号，供顶点缓冲池索引缓存失效 | Pool-table generation guarded by g_mu, used to invalidate vertex-buffer pool-index hints
 // 内存池按需驻留：零拷贝缓冲放进驻留集，iOS 会把整个池读进内存并钉成 wired（不计入 footprint，也不能被换出），游戏从没用过的池也一样——
 // 真机 17 Pro Max 实测 512 MB 的渲染目标池一局取址 0 次，放进驻留集整机 wired 高约 530 MB；A14 4 GB 机因此启动几秒就被系统按整机缺页结束（公开仓库 #37）。
 // 所以池建好时不放进驻留集，GPU 第一次经 mtl_addr / mtl_gpu_addr 取到它的地址时才放进去，并当场提交驻留集
@@ -451,7 +453,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     pthread_mutex_lock(&g_mu);
     if (g_npool == g_cap) { g_cap = g_cap ? g_cap * 2 : 64; g_pools = realloc(g_pools, g_cap * sizeof *g_pools); }
     g_pools[g_npool++] = (pool_ent){lo, hi, a, buf, buf.gpuAddress, mem, 0};   // 先不进驻留集：第一次被取址时才放进去（pool_res） | not in the residency set yet: put in the first time it is addressed (pool_res)
-    g_pool_adds++;
+    g_pool_adds++; g_pool_gen++;
     [g_keep addObject:buf];
     pthread_mutex_unlock(&g_mu);
 }
@@ -462,29 +464,47 @@ void mtl_pool_del(const void *mem) {
     pthread_mutex_lock(&g_mu);
     for (int i = 0; i < g_npool; i++)
         if (g_pools[i].key == mem) { gone = g_pools[i].buf; [g_keep removeObject:gone]; g_pools[i] = g_pools[--g_npool]; break; }
+    g_pool_gen++;
     pthread_mutex_unlock(&g_mu);
     defer_obj_release(gone);   // 退役：等用过它的提交完成后放掉，并移出驻留集（原先只从 g_keep 摘掉——驻留集强持有它，零拷贝缓冲对象永远不销毁） | retire: release after the submissions that used it complete, and remove from the residency set (it used to be only removed from g_keep - the residency set holds it strongly, so the zero-copy buffer object was never destroyed)
 }
 
+static int mtl_pool_find_locked(uint64_t addr, uint64_t len, int *hint, uint64_t *hint_gen, uint64_t *hint_addr, uint64_t *hint_len) {
+    int i = -1, cached_miss = 0;
+    if (hint && hint_gen && hint_addr && hint_len &&
+        nvn_pool_hint_key_matches(*hint_gen, g_pool_gen, *hint_addr, addr, *hint_len, len)) {
+        if (*hint == -1) cached_miss = 1;
+        else if (nvn_pool_hint_index_valid(*hint, g_npool, *hint_gen, g_pool_gen) &&
+                 nvn_pool_hint_range_matches(addr, len, g_pools[*hint].lo, g_pools[*hint].hi)) i = *hint;
+    }
+    if (i < 0 && !cached_miss) for (int j = 0; j < g_npool; j++)
+        if (nvn_pool_hint_range_matches(addr, len, g_pools[j].lo, g_pools[j].hi)) { i = j; break; }
+    if (hint && hint_gen && hint_addr && hint_len) { *hint = i; *hint_gen = g_pool_gen; *hint_addr = addr; *hint_len = len; }
+    return i;
+}
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
+    static _Thread_local int hint = -1; static _Thread_local uint64_t hint_gen, hint_addr, hint_len;
     int ok = 0;
     pthread_mutex_lock(&g_mu);
-    for (int i = 0; i < g_npool; i++)
-        if (addr >= g_pools[i].lo && addr + len <= g_pools[i].hi) {
-            pool_res(i); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; ok = 1; break;
-        }
+    int i = mtl_pool_find_locked(addr, len, &hint, &hint_gen, &hint_addr, &hint_len);
+    if (i >= 0) { pool_res(i); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; ok = 1; }
+    pthread_mutex_unlock(&g_mu);
+    return ok;
+}
+static int mtl_gpu_addr_impl(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_t *gpu, int *hint, uint64_t *hint_gen, uint64_t *hint_addr, uint64_t *hint_len) {
+    int ok = 0;
+    pthread_mutex_lock(&g_mu);
+    int i = mtl_pool_find_locked(addr, len, hint, hint_gen, hint_addr, hint_len);
+    if (i >= 0) { pool_res(i); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; *gpu = g_pools[i].gpu + *off; ok = 1; }
     pthread_mutex_unlock(&g_mu);
     return ok;
 }
 int mtl_gpu_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_t *gpu) {
-    int ok = 0;
-    pthread_mutex_lock(&g_mu);
-    for (int i = 0; i < g_npool; i++)
-        if (addr >= g_pools[i].lo && addr + len <= g_pools[i].hi) {
-            pool_res(i); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; *gpu = g_pools[i].gpu + *off; ok = 1; break;
-        }
-    pthread_mutex_unlock(&g_mu);
-    return ok;
+    static _Thread_local int hint = -1; static _Thread_local uint64_t hint_gen, hint_addr, hint_len;
+    return mtl_gpu_addr_impl(addr, len, buf, off, gpu, &hint, &hint_gen, &hint_addr, &hint_len);
+}
+static int mtl_gpu_addr_cached(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_t *gpu, int *hint, uint64_t *hint_gen, uint64_t *hint_addr, uint64_t *hint_len) {
+    return mtl_gpu_addr_impl(addr, len, buf, off, gpu, hint, hint_gen, hint_addr, hint_len);
 }
 
 // ---------- 提交 ----------
@@ -4813,11 +4833,12 @@ frz_plain:;
       FX_SET(5, !memcmp(g_enc_fx.db, d, sizeof d), memcpy(g_enc_fx.db, d, sizeof d), enc_r_depth_bias(en, d[0], d[1], d[2])); }
     FX_SET(6, !memcmp(g_enc_fx.bc, S.blend_color, sizeof g_enc_fx.bc), memcpy(g_enc_fx.bc, S.blend_color, sizeof g_enc_fx.bc), enc_r_blend_color(en, S.blend_color[0], S.blend_color[1], S.blend_color[2], S.blend_color[3]));
     #undef FX_SET
+    static _Thread_local int vb_pool_hint[16] = {-1}; static _Thread_local uint64_t vb_pool_gen[16], vb_pool_addr[16], vb_pool_len[16];
     for (int s_ = 0; s_ < 16; s_++) {
         if (!S.vbuf[s_].address) continue;
         void *mb; uint64_t mo;
         uint64_t gpu;
-        if (mtl_gpu_addr(S.vbuf[s_].address, 1, &mb, &mo, &gpu)) { vbuf_bind_once(en, 16 + s_, gpu); use_rec("buf", S.vbuf[s_].address, S.vbuf[s_].size, 0, NULL); }
+        if (mtl_gpu_addr_cached(S.vbuf[s_].address, 1, &mb, &mo, &gpu, &vb_pool_hint[s_], &vb_pool_gen[s_], &vb_pool_addr[s_], &vb_pool_len[s_])) { vbuf_bind_once(en, 16 + s_, gpu); use_rec("buf", S.vbuf[s_].address, S.vbuf[s_].size, 0, NULL); }
     }
     static id<MTLBuffer> zero; if (!zero) { zero = [g_dev newBufferWithLength:64 options:MTLResourceStorageModeShared]; res_add(zero); }
     static uint64_t zero_gpu; if (!zero_gpu) zero_gpu = zero.gpuAddress;

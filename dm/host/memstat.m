@@ -20,7 +20,11 @@
 #import <Metal/Metal.h>
 #include <TargetConditionals.h>
 #include <mach/mach.h>
+#if defined(__arm64__)
+#include <mach/arm/thread_status.h>
+#endif
 #include <mach/vm_statistics.h>
+#include <dlfcn.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #if TARGET_OS_IPHONE
@@ -148,19 +152,43 @@ __attribute__((constructor)) static void memstat_start(void) { dm_memstat_start_
 
 // ---------- 按线程 CPU：DM_THRCPU=<tsv 路径>[,间隔秒（缺省 10）]（Mac / iOS 通用；iOS 相对名 → 容器 Documents）----------
 // 每个间隔遍历本进程全部线程（task_threads），THREAD_EXTENDED_INFO 取线程名与用户 + 系统 CPU 时间（ns），按线程号差分：
-// 每行「秒 线程号 线程名 CPU%（100 = 一个核）」；末行「秒 - 合计 CPU%」。发热归因用（哪条线程吃 CPU），与 DM_HEAT 同时开可对照温控。
+// 每行「秒 线程号 线程名 CPU%（100 = 一个核）未命名高占用线程的 PC」；末行「秒 - 合计 CPU% -」。PC 只对未命名且 CPU ≥5% 的线程做一次尽力读取。
 // ---------- Per-thread CPU: DM_THRCPU=<tsv path>[,interval in seconds (default 10)] (common to Mac / iOS; on iOS a relative name → the container's Documents) ----------
 // Every interval, walk all threads of this process (task_threads), take the thread name and user + system CPU time (ns) from THREAD_EXTENDED_INFO, and difference them by thread id:
-// each line is "seconds, thread id, thread name, CPU% (100 = one core)"; the last line is "seconds, -, total, CPU%". Used for heat attribution (which thread eats CPU); enable together with DM_HEAT to compare against thermal state.
+// each row is "seconds, thread id, thread name, CPU% (100 = one core), PC for unnamed hot threads"; the total row has "seconds, -, total, CPU%, -". The PC is a best-effort single sample only for unnamed threads at >=5% CPU.
 #include <mach/thread_info.h>
 #define THR_MAX 512
+// Best-effort PC sample for a hot unnamed thread; does not explicitly suspend the sampled thread.
+static void thrcpu_pc(thread_act_t th, char *out, size_t cap) {
+    if (!cap) return;
+    snprintf(out, cap, "?");
+#if defined(__arm64__)
+    arm_thread_state64_t st; mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+    if (thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&st, &count) != KERN_SUCCESS) return;
+    uint64_t pc = __darwin_arm_thread_state64_get_pc(st);
+    module_t *m = module_of((const void *)(uintptr_t)pc);
+    if (m) { snprintf(out, cap, "%s+%#llx", m->name, (unsigned long long)(pc - (uint64_t)m->base)); return; }
+    Dl_info info;
+    if (dladdr((const void *)(uintptr_t)pc, &info) && info.dli_fname) {
+        const char *base = strrchr(info.dli_fname, '/'); base = base ? base + 1 : info.dli_fname;
+        if (info.dli_sname && info.dli_saddr)
+            snprintf(out, cap, "%s!%s+%#llx", base, info.dli_sname, (unsigned long long)(pc - (uintptr_t)info.dli_saddr));
+        else if (info.dli_fbase)
+            snprintf(out, cap, "%s+%#llx", base, (unsigned long long)(pc - (uintptr_t)info.dli_fbase));
+        else snprintf(out, cap, "%s@%#llx", base, (unsigned long long)pc);
+    } else snprintf(out, cap, "%#llx", (unsigned long long)pc);
+#else
+    (void)th;
+    snprintf(out, cap, "unsupported");
+#endif
+}
 static void *thrcpu_thread(void *p) {
     pthread_setname_np("dm-thrcpu");
     char path[1024]; int iv = 10; { const char *c = strchr((const char *)p, ','); snprintf(path, sizeof path, "%.*s", c ? (int)(c - (const char *)p) : (int)strlen(p), (const char *)p); if (c) iv = atoi(c + 1); }
     free(p);
     if (iv < 1) iv = 1; if (iv > 300) iv = 300;
     FILE *f = fopen(path, "w"); if (!f) return NULL;
-    fprintf(f, "秒\t线程号\t线程名\tCPU%%\n"); fflush(f);
+    fprintf(f, "秒\t线程号\t线程名\tCPU%%\t高占用未命名线程PC\n"); fflush(f);
     static uint64_t ids[THR_MAX], last[THR_MAX]; int n = 0; uint64_t t0 = now_ns(), tl = t0;
     for (;;) {
         sleep(iv); uint64_t t = now_ns(); double dt = (t - tl) / 1e9, tot = 0; tl = t;
@@ -173,14 +201,15 @@ static void *thrcpu_thread(void *p) {
                 uint64_t cpu = ei.pth_user_time + ei.pth_system_time; int k = 0; while (k < n && ids[k] != ii.thread_id) k++;
                 if (k == n && n < THR_MAX) { ids[n] = ii.thread_id; last[n] = cpu; n++; }   // 新线程：本轮只记基线 | New thread: only record the baseline this round
                 else if (k < n) { double pct = (cpu - last[k]) / 1e9 / dt * 100; last[k] = cpu; tot += pct;
-                    if (pct >= 0.5) { char gn[96]; int thr_name_of(pthread_t, char *, size_t); pthread_t pt = pthread_from_mach_thread_np(th[i]);
-                        const char *nm = pt && thr_name_of(pt, gn, sizeof gn) ? gn : ei.pth_name[0] ? ei.pth_name : "-";   // 客体线程：句柄 + 客体名；宿主线程：pthread 名 | Guest thread: handle + guest name; host thread: pthread name
-                        fprintf(f, "%.0f\t%llu\t%s\t%.1f\n", (t - t0) / 1e9, ii.thread_id, nm, pct); } }
+                    if (pct >= 0.5) { char gn[96], pc[192] = "-"; int thr_name_of(pthread_t, char *, size_t); pthread_t pt = pthread_from_mach_thread_np(th[i]);
+                        int guest_named = pt && thr_name_of(pt, gn, sizeof gn); const char *nm = guest_named ? gn : ei.pth_name[0] ? ei.pth_name : "-";   // 客体线程：句柄 + 客体名；宿主线程：pthread 名 | Guest thread: handle + guest name; host thread: pthread name
+                        if (!guest_named && !ei.pth_name[0] && pct >= 5.0) thrcpu_pc(th[i], pc, sizeof pc); // 只对高占用未命名线程取一次 PC，避免普通采样开销
+                        fprintf(f, "%.0f\t%llu\t%s\t%.1f\t%s\n", (t - t0) / 1e9, ii.thread_id, nm, pct, pc); } }
             }
             mach_port_deallocate(mach_task_self(), th[i]);
         }
         vm_deallocate(mach_task_self(), (vm_address_t)th, nt * sizeof *th);
-        fprintf(f, "%.0f\t-\t合计\t%.1f\n", (t - t0) / 1e9, tot); fflush(f);
+        fprintf(f, "%.0f\t-\t合计\t%.1f\t-\n", (t - t0) / 1e9, tot); fflush(f);
     }
     return NULL;
 }

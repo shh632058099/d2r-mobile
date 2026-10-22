@@ -1527,6 +1527,8 @@ void nvn_gpu_recent(double *avg, double *p95, unsigned *n);
 // DM_HEAT not set (normal player launch): log one line with the same readings every 10 seconds, plus battery level / charging / low power mode -- when a player reports "lag / hot / battery drain", the log has the background at that time.
 // One sample is a few system calls plus one sort of at most 1024 numbers; its cost is logged at the end of the line (「取样 … ms」(sample … ms)); the interval of a tick that went through background is inaccurate and is not logged.
 void front_ios_heat_start(uint64_t (*presents)(void), int has_gpu) {
+    extern int mtl_fps_target(void);
+    extern float dm_3d_scale_cur(void);
     const char *e = getenv("DM_HEAT");
     if (!e) {
         if (!has_gpu) return;   // 资源下载界面那次调用不起（进游戏后还会再调一次，免得起两个） | The call from the asset download UI does not start it (it is called again after entering the game, to avoid starting two)
@@ -1541,7 +1543,7 @@ void front_ios_heat_start(uint64_t (*presents)(void), int has_gpu) {
                 float bl = UIDevice.currentDevice.batteryLevel; UIDeviceBatteryState bs = UIDevice.currentDevice.batteryState; char gpu[64] = "GPU 无样本", bat[32] = "电量 未知";
                 if (gn) snprintf(gpu, sizeof gpu, "GPU %.2f / p95 %.2f ms（%u 帧）", ga, gp, gn);
                 if (bl >= 0) snprintf(bat, sizeof bat, "电量 %.0f%%", bl * 100);
-                LOG("[诊断] 第 %.0f 秒 CPU %.0f%% 帧率 %.1f %s 温控 %ld 亮度 %.2f %s %s 低电量模式 %s 取样 %.2f ms", (t - t0) / 1e9, (cpu - cl) / dt * 100, (p - pl) / dt, gpu,
+                LOG("[诊断] 第 %.0f 秒 CPU %.0f%% 帧率 %.1f 目标 %d 3D %.2f %s 温控 %ld 亮度 %.2f %s %s 低电量模式 %s 取样 %.2f ms", (t - t0) / 1e9, (cpu - cl) / dt * 100, (p - pl) / dt, mtl_fps_target(), dm_3d_scale_cur(), gpu,
                     (long)NSProcessInfo.processInfo.thermalState, UIScreen.mainScreen.brightness, bat,
                     bs == UIDeviceBatteryStateCharging ? "充电中" : bs == UIDeviceBatteryStateFull ? "已充满" : bs == UIDeviceBatteryStateUnplugged ? "未充电" : "充电状态未知",
                     NSProcessInfo.processInfo.lowPowerModeEnabled ? "开" : "关", (now_ns() - t) / 1e6);
@@ -1552,15 +1554,15 @@ void front_ios_heat_start(uint64_t (*presents)(void), int has_gpu) {
     char rel[512]; snprintf(rel, sizeof rel, "%.*s", (int)strcspn(e, ","), e); const char *c = strchr(e, ','); int iv = c ? atoi(c + 1) : 10;
     NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
     FILE *f = fopen([doc stringByAppendingPathComponent:@(rel)].fileSystemRepresentation, "w"); if (!f) return;
-    fprintf(f, "秒\t温控\tCPU%%\t出图帧率\tGPU均值ms\tGPU_p95ms\tGPU样本\t亮度\t最高刷新\n"); fflush(f);
+    fprintf(f, "秒\t温控\tCPU%%\t出图帧率\t目标帧率\t3D比例\tGPU均值ms\tGPU_p95ms\tGPU样本\t亮度\t最高刷新\n"); fflush(f);
     __block uint64_t t0 = now_ns(), tl = t0, pl = presents(); __block double cl = 0;
     { struct rusage ru; getrusage(RUSAGE_SELF, &ru); cl = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6; }
     [NSTimer scheduledTimerWithTimeInterval:iv repeats:YES block:^(NSTimer *tm) { (void)tm;
         uint64_t t = now_ns(), p = presents(); struct rusage ru; getrusage(RUSAGE_SELF, &ru);
         double cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6, dt = (t - tl) / 1e9;
         double ga = -1, gp = -1; unsigned gn = 0; if (has_gpu) nvn_gpu_recent(&ga, &gp, &gn);
-        fprintf(f, "%.0f\t%ld\t%.1f\t%.1f\t%.2f\t%.2f\t%u\t%.2f\t%ld\n", (t - t0) / 1e9, (long)NSProcessInfo.processInfo.thermalState, (cpu - cl) / dt * 100,
-                (p - pl) / dt, ga, gp, gn, UIScreen.mainScreen.brightness, (long)UIScreen.mainScreen.maximumFramesPerSecond);
+        fprintf(f, "%.0f\t%ld\t%.1f\t%.1f\t%d\t%.2f\t%.2f\t%.2f\t%u\t%.2f\t%ld\n", (t - t0) / 1e9, (long)NSProcessInfo.processInfo.thermalState, (cpu - cl) / dt * 100,
+                (p - pl) / dt, mtl_fps_target(), dm_3d_scale_cur(), ga, gp, gn, UIScreen.mainScreen.brightness, (long)UIScreen.mainScreen.maximumFramesPerSecond);
         fflush(f); tl = t; pl = p; cl = cpu; }];
 }
 

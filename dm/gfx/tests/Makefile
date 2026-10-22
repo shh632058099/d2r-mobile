@@ -27,9 +27,16 @@ t_cover: t_cover.c ../nvn/nvn_cover.h
 t_vbuf_cache: t_vbuf_cache.c ../nvn/nvn_vbuf_cache.h
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -o $@ t_vbuf_cache.c
 
-.PHONY: portable
-portable: t_vbuf_cache
+t_pool_hint: t_pool_hint.c ../nvn/nvn_pool_hint.h
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -o $@ t_pool_hint.c
+
+.PHONY: portable clean-portable
+portable: t_vbuf_cache t_pool_hint
 	./t_vbuf_cache
+	./t_pool_hint
+
+clean-portable:
+	$(RM) t_vbuf_cache t_pool_hint
 
 t_pace: t_pace.c ../nvn/nvn_pace.h
 	clang -O1 -Wall -o $@ t_pace.c
@@ -79,6 +86,7 @@ run: \
 	t_nvn \
 	t_pace \
 	t_pfv \
+	t_pool_hint \
 	t_present_crop \
 	t_pso_skey \
 	t_refl \
@@ -119,6 +127,7 @@ run: \
 	DM_NVN_UNWRITTEN_DC=0 MTL_DEBUG_LAYER=1 ./t_rt_range --small-depth
 	DM_NVN_UNWRITTEN_DC=0 MTL_DEBUG_LAYER=1 ./t_rt_range --sample-attachment --both-flags
 	./t_pso_skey
+	./t_pool_hint
 	MTL_DEBUG_LAYER=1 ./t_pfv
 	MTL_DEBUG_LAYER=1 ./t_rt_srgb_view
 	python3 test_tbdr_budget.py
