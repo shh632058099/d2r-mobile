@@ -845,14 +845,22 @@ static xjob g_xq[XQ]; static uint64_t g_xq_in, g_xq_done;   // 入队任务数 /
 static struct { uint64_t job, tk; } g_xtk[XTK];               // 出图任务号 → 出图线程票号 | Present job number -> present thread ticket
 static pthread_mutex_t g_xmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_xcv = PTHREAD_COND_INITIALIZER;
 static int g_x_sync; static pthread_t g_x_thr; static mach_port_t g_x_port;   // 翻译线程（策略读数用） | Translation thread (for policy readings)
+// Aggregate CPU phase costs without per-command logging; read on the 300-frame summary.
+static _Atomic uint64_t g_x_prepare_cpu_ns, g_x_replay_cpu_ns, g_x_commit_cpu_ns;
 static void x_submit(const uint64_t *h, int n, uint64_t sub, uint64_t host) {
     mtl_host_apply(host);
     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
     mtl_sub_begin();
     mtl_sub_index(h, n);
+    uint64_t cprep = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
     for (int i = 0; i < n; i++) { mtl_exec_rest(h + i + 1, n - i - 1); mtl_exec((const uint8_t *)h[i]); }
     mtl_exec_rest(NULL, 0);
+    uint64_t creplay = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
     uint64_t f = mtl_sub_commit();
+    uint64_t ccommit = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
+    atomic_fetch_add(&g_x_prepare_cpu_ns, cprep - c0);
+    atomic_fetch_add(&g_x_replay_cpu_ns, creplay - cprep);
+    atomic_fetch_add(&g_x_commit_cpu_ns, ccommit - creplay);
     if (f != sub) { static int red; if (!red++) LOG("【红】翻译队列：第 %llu 次提交的 Metal 栅栏是 %llu，栅栏与提交数对不上，游戏等同步会提前 / 推迟放行", (unsigned long long)sub, (unsigned long long)f); }
     snap_tick(sub);
     uint64_t dw = now_ns() - t0;
@@ -1129,6 +1137,18 @@ static void tsummary(uint64_t frame) {
       if (k) { qsort(v, k, sizeof *v, dcmp); LOG("[nvn] 上屏 至帧 %llu：%u 帧，掉帧 %u（丢弃 %u），间隔 p5 %.2f / p50 %.2f / p95 %.2f，p99 %.2f ms；footprint %.0f MiB；亮度 %.2f；温控 %d", frame, k + discard, drop, discard,
           v[(k * 5) / 100], v[k / 2], v[(k * 95) / 100 < k ? (k * 95) / 100 : k - 1], v[(k * 99) / 100 < k ? (k * 99) / 100 : k - 1], fp, br, dm_thermal_now()); }
       g_presn = 0; }
+    { static uint64_t pp, pr, pl, pst, pf, pfull, prep_old, replay_old, commit_old; uint64_t pass, draw, load, store, full;
+      mtl_stats(&pass, &draw); mtl_bw(&load, &store, &full);
+      if (pf && frame > pf) { double frames = (double)(frame - pf);
+        uint64_t p = atomic_load(&g_x_prepare_cpu_ns), r = atomic_load(&g_x_replay_cpu_ns), k = atomic_load(&g_x_commit_cpu_ns);
+        LOG("[nvn] 渲染负载 至帧 %llu：每帧 RenderPass %.1f Draw %.0f 附件Load %.2f MiB Store %.2f MiB 全量读写通道 %.1f；翻译CPU 准备 %.3f ms 执行 %.3f ms 提交 %.3f ms", frame,
+            (double)(pass - pp) / frames, (double)(draw - pr) / frames,
+            (double)(load - pl) / 1048576.0 / frames, (double)(store - pst) / 1048576.0 / frames,
+            (double)(full - pfull) / frames, (double)(p - prep_old) / 1e6 / frames,
+            (double)(r - replay_old) / 1e6 / frames, (double)(k - commit_old) / 1e6 / frames);
+        prep_old = p; replay_old = r; commit_old = k;
+      } else { prep_old = atomic_load(&g_x_prepare_cpu_ns); replay_old = atomic_load(&g_x_replay_cpu_ns); commit_old = atomic_load(&g_x_commit_cpu_ns); }
+      pp = pass; pr = draw; pl = load; pst = store; pfull = full; pf = frame; }
     { static uint64_t pi, pc, pd, pf; uint64_t ci = atomic_load(&g_cum_sub_instr), cc = atomic_load(&g_cum_sub_cpu_ns), ps_, dr_; mtl_stats(&ps_, &dr_);   // 翻译层 | translation layer
       if (pf && frame > pf && dr_ > pd) LOG("[nvn] 翻译 至帧 %llu：每次绘制 %.0f 条指令，每帧提交 %.2f M 条 / CPU %.3f ms，每帧绘制 %.0f", frame,
           (double)(ci - pi) / (double)(dr_ - pd), (ci - pi) / 1e6 / (double)(frame - pf), (cc - pc) / 1e6 / (double)(frame - pf), (double)(dr_ - pd) / (double)(frame - pf));

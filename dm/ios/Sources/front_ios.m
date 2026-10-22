@@ -6,10 +6,27 @@
 // front_run runs the guest on that thread; real touch points keep the dm_touch_set path, and the independent controller outputs the full controller state.
 // The former any-A placeholder on the right half of the screen has been removed; only widget hits generate button presses.
 #import <UIKit/UIKit.h>
+#include <sys/utsname.h>
+#include <stdatomic.h>
+#include "dm_thermal_policy.h"
 static double g_dm_brightness = -1;
 double dm_brightness_now(void) { return g_dm_brightness; }
 static volatile int g_dm_thermal = -1;
-int dm_thermal_now(void) { return g_dm_thermal; }   // 最近的温控档位（0 正常 / 1 微热 / 2 严重 / 3 危急；−1 = 未读）   // 最近一次读到的屏幕亮度（−1 = 未读） | Most recent thermal state (0 nominal / 1 fair / 2 serious / 3 critical; −1 = not read)   // Most recently read screen brightness (−1 = not read)
+int dm_thermal_now(void) { return g_dm_thermal; }
+// iPhone 15 Pro Max (iPhone16,2): automatically reduce FPS after sustained heat.
+// Other devices keep existing behavior. The manual 30 FPS choice always wins.
+static _Atomic int g_dm_smart_cap = 60;
+int dm_thermal_fps_cap(void) { return atomic_load(&g_dm_smart_cap); }
+static int dm_smart_thermal_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        struct utsname u;
+        enabled = uname(&u) == 0 && strcmp(u.machine, "iPhone16,2") == 0;
+        const char *override = getenv("DM_SMART_THERMAL");
+        if (override) enabled = strcmp(override, "0") != 0;
+    }
+    return enabled;
+}
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 #include <signal.h>
@@ -1122,18 +1139,18 @@ void front_save_failed(int err) {
     });
 }
 
-#define THERMAL_RESTORE_SEC 60
-
 static void thermal_apply(void) {
-    static unsigned gen;                       // 每次状态变化作废之前排的「恢复主机模式」 | Every state change invalidates the previously scheduled "restore docked mode"
-    NSProcessInfoThermalState s = NSProcessInfo.processInfo.thermalState;
-    unsigned my = ++gen;
-    if (s >= NSProcessInfoThermalStateSerious) {
-        if (getenv("DM_THERMAL_NOFALLBACK")) { LOG("前端：过热 %ld，DM_THERMAL_NOFALLBACK 不降档（只供功耗测量）", (long)s); return; }
-        LOG("前端：过热 %ld（3D 比例改由实际掉帧驱动，这里只记一行）", (long)s); return; }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)THERMAL_RESTORE_SEC * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        if (my == gen && NSProcessInfo.processInfo.thermalState < NSProcessInfoThermalStateSerious) { LOG("前端：温度回落持续 %d 秒", THERMAL_RESTORE_SEC); }
-    });
+    if (!dm_smart_thermal_enabled()) return;
+    if (getenv("DM_THERMAL_NOFALLBACK")) return; // diagnostic opt-out
+    static dm_thermal_policy policy = { .last_state = -1, .since = -1 };
+    int state = (int)NSProcessInfo.processInfo.thermalState;
+    int old = atomic_load(&g_dm_smart_cap);
+    dm_thermal_policy_update(&policy, state, CACurrentMediaTime());
+    int cap = policy.cap30 ? 30 : 60;
+    if (cap != old) {
+        atomic_store(&g_dm_smart_cap, cap);
+        LOG("智能散热：温控 %d，目标帧率上限 %d → %d", state, old, cap);
+    }
 }
 
 // 音频暂停有两个互不相干的原因：在后台、会话被打断（来电 / 闹钟）。两个都解除才恢复出声——
@@ -1413,7 +1430,8 @@ void front_ios_lifecycle_install(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(st * 1e9)), dispatch_get_main_queue(), ^{ window_shot(name); });
     }    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter; NSOperationQueue *mq = NSOperationQueue.mainQueue;
     [nc addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil queue:mq usingBlock:^(NSNotification *n) { (void)n; thermal_apply(); }];
-    if (NSProcessInfo.processInfo.thermalState >= NSProcessInfoThermalStateSerious) thermal_apply();   // 启动时已经热 | Already hot at launch
+    thermal_apply(); // initialize state even if already warm at launch
+    [NSTimer scheduledTimerWithTimeInterval:10 repeats:YES block:^(NSTimer *tm) { (void)tm; thermal_apply(); }];
 
     AVAudioSession *as = AVAudioSession.sharedInstance; NSError *e = nil;
     // 类别 Playback：静音开关开着也出声。带 MixWithOthers：Playback 缺省是独占的，激活会话会打断别的 App 的声音——
