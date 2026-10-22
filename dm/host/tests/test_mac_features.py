@@ -23,7 +23,8 @@ class MacFeatures(unittest.TestCase):
                               'custom = 1; assert(enabled() == atoi(argv[2])); }\n')
             for ios in (0, 1):
                 binary = Path(tmp) / f'switch-{ios}'
-                subprocess.run(['clang', '-Wall', '-Werror', f'-DTEST_PLATFORM={ios}',
+                compiler = os.environ.get('CC', 'clang')
+                subprocess.run([compiler, '-Wall', '-Werror', f'-DTEST_PLATFORM={ios}',
                                 str(source), '-o', str(binary)], check=True)
                 for app in (None, '', '0', '1'):
                     for override in (None, '0', '1'):

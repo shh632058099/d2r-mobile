@@ -8,7 +8,8 @@
 #include HLE_OE_SOURCE
 #include <signal.h>
 #include <sys/wait.h>
-uint64_t now_ns(void) { return 0; }
+static uint64_t test_clock_ns;
+uint64_t now_ns(void) { return test_clock_ns; }
 // 3D 渲染比例（scale3d_tick）的外部依赖：单测里没有模块表与图形层，桩成「没有 main 模块」→ 该函数直接返回
 // External dependencies of the 3D render scale (scale3d_tick): the unit test has no module table or graphics layer, so they are stubbed as "no main module" -> the function returns immediately
 module_t g_mod[MAX_MOD]; int g_nmod;
@@ -16,7 +17,8 @@ void dm_guest_write_prepare(void *a, size_t n) { (void)a; (void)n; }
 uint64_t dm_nvn_frame_count(void) { return 0; }
 int dm_nvn_ruler_truth(void) { return 0; }
 int dm_ingame_now(void) { return 1; }
-int mtl_fps_target(void) { return 60; }   // 目标帧率（nvn_mtl.m）：单测里恒为 60，30 帧档的用例直接给 period_ms | target frame rate (nvn_mtl.m): always 60 in the unit test, and the 30 fps mode cases pass period_ms directly
+static int test_target_fps = 60;
+int mtl_fps_target(void) { return test_target_fps; }   // 可切换目标帧率，验证真实 feed 状态转移 | Switchable target FPS for runtime feed transition tests
 double mtl_display_refresh(void) { return 0; }   // 屏幕刷新率（nvn_mtl.m）：单测里没有窗口，读不到 → 出图帧率按目标 | Screen refresh rate (nvn_mtl.m): unit tests have no window, so it cannot be read → present frame rate uses the target
 double dm_pace_hz(double screen_hz, double floor_hz) { return screen_hz > 0 ? screen_hz : floor_hz; }   // 只在读不到刷新率时被调，按目标 | Only called when the refresh rate cannot be read; uses the target
 pthread_key_t g_keyres[2];                                   // 分辨率参数位（loader.c）的桩：没建键，取走 31 时不写线程槽 | stub for the resolution parameter slot (loader.c): no key created, so taking 31 does not write the thread slot
@@ -74,8 +76,10 @@ static uint64_t s3_now; static scale3d_ctl s3; static int s3_dm;   // s3_dm：�
 static int s3_one(double iv) { int b = s3.level; s3_now += (uint64_t)((iv > 0 ? iv : 16.6667) * 1e6); int lv = scale3d_ctl_step(&s3, iv, s3_now); s3_dm += lv != b; return lv; }
 static int s3_n(int n, double iv) { int lv = s3.level; for (int i = 0; i < n; i++) lv = s3_one(iv); return lv; }
 #define F60 16.6667   // 60 帧：每窗 120 帧（120 × 16.6667 = 2000.004 ms） | 60 fps: 120 frames per window (120 * 16.6667 = 2000.004 ms)
-#define D60 33.4      // 掉帧（> 25.0005）：全掉帧时每窗 60 帧（60 × 33.4 = 2004 ms） | Dropped frames (> 25.0005): with every frame dropped, 60 frames per window (60 × 33.4 = 2004 ms)
-static void s3_hold_pass(void) { uint64_t end = s3.hold_until; while (s3_now < end) s3_one(F60); }   // 走完停判（停判中的帧不计） | Run through the judging pause (frames during the pause are not counted)
+#define D60 33.4      // 掉帧（> 25.0005）：全掉帧时每窗 60 帧（60 × 33.4 = 2004 ms） | Dropped frames (> 25.0005): with every frame dropped, 60 frames per window (60 * 33.4 = 2004 ms)
+#define F30 33.34     // 30 帧：每窗约 60 帧 | 30 fps: about 60 frames per window
+#define D30 66.7      // 30 帧掉帧（> 50 ms）：每窗约 30 帧 | 30 fps dropped interval (> 50 ms): about 30 frames per window
+static void s3_hold_pass(void) { uint64_t end = s3.hold_until; double iv = s3.period_ms > 0 ? s3.period_ms : 16.6667; while (s3_now < end) s3_one(iv); }   // 走完停判（停判中的帧不计） | Run through the judging pause (frames during the pause are not counted)
 // 真机实玩第二段每 10 秒窗的「25 ms 档 / ≥33 ms 档」帧数（手抄自 perf 行）
 // Frame counts of the "25 ms bucket / >=33 ms bucket" for each 10-second window of the second section of real play on a real device (copied by hand from perf lines)
 static const int s3_rows[18][2] = {{0,1},{2,4},{3,3},{0,0},{10,12},{0,0},{0,0},{0,0},{2,1},{0,0},{6,8},{0,0},{0,0},{0,0},{2,3},{5,4},{0,0},{0,0}};
@@ -86,8 +90,24 @@ static int s3_replay(int clustered) {   // clustered = 1：每 10 秒的慢帧�
     return s3_dm;
 }
 static void test_scale3d(void) {
+    CHECK(scale3d_base_level(1, 0, 3) == 1, "30 帧省电：默认基准档为 0.70");
+    CHECK(scale3d_base_level(0, 0, 3) == 0, "60 帧：保留配置基准档");
+    CHECK(scale3d_base_level(1, 1, 3) == 0, "显式 DM_3D_SCALE：不覆盖用户配置");
+    CHECK(scale3d_base_level(1, 0, 0) == 0, "用户下限高于 0.70：不越过下限");
+    CHECK(scale3d_level_value(0, 0.65f) == 0.65f, "显式 0.65 配置：0 档保持用户值");
+    CHECK(scale3d_level_value(1, 0.65f) == 0.60f, "显式 0.65 配置：第 1 档直接降到 0.60，不出现重复档");
+    CHECK(scale3d_level_value(2, 0.65f) == 0.55f, "显式 0.65 配置：第 2 档为 0.55");
+    CHECK(scale3d_max_level(0.60f, 0.65f) == 1, "显式 0.65 配置、下限 0.60：只保留一个有效降档");
+    CHECK(scale3d_max_level(0.55f, 0.65f) == 2, "显式 0.65 配置、下限 0.55：只统计实际可达档位");
+    CHECK(scale3d_max_level(0.60f, 0.75f) == 3, "默认 0.75 配置、下限 0.60：保留 0.70/0.65/0.60 三档");
     s3 = (scale3d_ctl){.max_level = 2}; s3_now = 1000 * S3_SEC;
     CHECK(s3_n(1200, F60) == 0, "动态比例：60 帧稳 20 秒 → 保持 0 档");
+    s3 = (scale3d_ctl){.max_level = 3, .min_level = 1, .level = 1, .period_ms = 1000.0 / 30}; s3_now = 1050 * S3_SEC;
+    CHECK(s3_n(900, F30) == 1, "30 帧省电基准：稳定 30 秒不自动升回 0.75");
+    CHECK(s3_n(60, D30) == 2, "30 帧省电基准：实际掉帧仍可继续降档");
+    s3_hold_pass();
+    CHECK(s3_n(900, F30) == 1, "30 帧省电基准：稳定后只恢复到 0.70，不高于基准");
+    s3 = (scale3d_ctl){.max_level = 2}; s3_now = 1000 * S3_SEC;
     CHECK(s3_n(1000, 25.0) == 0, "动态比例：25.0 ms（未超 25.0005）不算掉帧 → 不降");
     s3 = (scale3d_ctl){.max_level = 2}; s3_now = 1100 * S3_SEC;
     CHECK(s3_n(299, D60) == 0, "快降：全掉帧 4 窗多 1 帧不到（不足 5 窗）→ 还没降");
@@ -140,8 +160,57 @@ static void test_scale3d(void) {
     printf("  （实玩第二段回放：慢帧均匀散开换级 %d 次，挤在一起换级 %d 次）\n", a, b);
     CHECK(a == 0 && b == 0, "动态比例：实玩第二段的慢帧序列（帧率 59+）不论散开还是挤在一起都不换级");
 }
+static void feed_scale_frames(int count, double interval_ms, uint64_t step_ns) {
+    for (int i = 0; i < count; i++) { test_clock_ns += step_ns; dm_3d_scale_feed(interval_ms); }
+}
+static int child_scale3d_config(int mode) {
+    fflush(stdout); pid_t p = fork(); if (p < 0) return 0;
+    if (!p) {
+        unsetenv("DM_3D_SCALE_DYN"); unsetenv("DM_THERMAL_NOFALLBACK"); unsetenv("DM_3D_SCALE");
+        unsetenv("DM_3D_SCALE_FLOOR"); unsetenv("DM_3D_SCALE_DYN_INJECT");
+        if (mode == 0) setenv("DM_3D_SCALE_DYN", "0", 1);
+        if (mode == 1) setenv("DM_3D_SCALE", "0.65", 1);
+        if (mode == 2) setenv("DM_3D_SCALE_FLOOR", "0.75", 1);
+        test_target_fps = 30; test_clock_ns = 100 * S3_SEC; dm_3d_quality_mode_set(0);
+        dm_3d_scale_feed(1000.0 / 30);
+        _exit(atomic_load(&g_scale3d_level) == 0 ? 0 : 1);
+    }
+    int st; return waitpid(p, &st, 0) == p && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+static void test_scale3d_env_overrides(void) {
+    CHECK(child_scale3d_config(0), "iOS runtime：DM_3D_SCALE_DYN=0 不进入 0.70 省电基准");
+    CHECK(child_scale3d_config(1), "iOS runtime：显式 DM_3D_SCALE 不被 30 帧默认基准覆盖");
+    CHECK(child_scale3d_config(2), "iOS runtime：高于 0.70 的下限不会被省电基准越过");
+}
+static void test_scale3d_runtime(void) {
+    unsetenv("DM_3D_SCALE_DYN"); unsetenv("DM_THERMAL_NOFALLBACK"); unsetenv("DM_3D_SCALE");
+    unsetenv("DM_3D_SCALE_FLOOR"); unsetenv("DM_3D_SCALE_DYN_INJECT");
+    dm_3d_quality_mode_set(0); test_target_fps = 30; test_clock_ns = 100 * S3_SEC;
+    dm_3d_scale_feed(1000.0 / 30);
+    CHECK(atomic_load(&g_scale3d_level) == 1, "iOS runtime：启动即进入 30 帧 0.70 基准档");
+    test_target_fps = 60; test_clock_ns += 34 * 1000000ull; dm_3d_scale_feed(16.6667);
+    CHECK(atomic_load(&g_scale3d_level) == 0, "iOS runtime：切回 60 帧恢复配置基准档");
+    test_target_fps = 30; test_clock_ns += 34 * 1000000ull; dm_3d_scale_feed(33.34);
+    CHECK(atomic_load(&g_scale3d_level) == 1, "iOS runtime：再次切到 30 帧恢复省电基准档");
+    dm_3d_quality_mode_set(1); test_clock_ns += 34 * 1000000ull; dm_3d_scale_feed(33.34);
+    CHECK(atomic_load(&g_scale3d_level) == 0, "iOS runtime：画质优先暂时覆盖 30 帧省电基准");
+    dm_3d_quality_mode_set(0); test_clock_ns += 34 * 1000000ull; dm_3d_scale_feed(33.34);
+    CHECK(atomic_load(&g_scale3d_level) == 1, "iOS runtime：切回流畅优先恢复 0.70 基准");
+    test_clock_ns = 130 * S3_SEC;
+    feed_scale_frames(900, 33.34, 33333333ull);
+    CHECK(atomic_load(&g_scale3d_level) == 1, "iOS runtime：30 帧稳定 30 秒不回升到 0.75");
+    feed_scale_frames(30, 66.7, 66666667ull);
+    CHECK(atomic_load(&g_scale3d_level) == 2, "iOS runtime：一个明显掉帧窗口后自动降到 0.65");
+    test_clock_ns += 4 * S3_SEC;
+    feed_scale_frames(900, 33.34, 33333333ull);
+    CHECK(atomic_load(&g_scale3d_level) == 1, "iOS runtime：恢复稳定后只回到 0.70 基准，不升到 0.75");
+    test_target_fps = 60; test_clock_ns += 34 * 1000000ull; dm_3d_scale_feed(16.6667);
+    CHECK(atomic_load(&g_scale3d_level) == 0, "iOS runtime：从省电模式切回 60 帧清除基准档");
+}
 int main(void) {
     test_scale3d();
+    test_scale3d_env_overrides();
+    test_scale3d_runtime();
     unsetenv("DM_OE_SCRIPT"); reset();
     CHECK(empty(), "初始空队列：返回false且不改输出");
     dm_focus_set(1); dm_set_opmode(1); CHECK(empty(), "相同状态不发通知");

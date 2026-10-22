@@ -2,8 +2,7 @@
 // 表 = 物品注释生成器（dm/ios/tools/annot_strings.py write_textbox_table）写的 dm_textbox_plain.tsv：一行「注释版 \t 文字框版」，\\ \n \t 转义。
 // 规则只有一条：表里的注释版才换。整串命中换成文字框版；整串不在表里但含表里的注释版（被拼进长句）就把那几段换掉；其余一个字节都不动。
 // Pure logic of the text box color code mapping table (read the table, rewrite by the table), never touching game memory; dm_textbox.c hooks the gate and calls it, and the unit test tests/t_textbox.c tests it directly.
-// Table = dm_textbox_plain.tsv written by the item annotation generator (dm/ios/tools/annot_strings.py write_textbox_table): one line of "annotated version \t text box version", with \\\\ \
-//  \\t escapes.
+// Table = dm_textbox_plain.tsv written by the item annotation generator (dm/ios/tools/annot_strings.py write_textbox_table): one line of annotated version / text box version, with backslash, newline, and tab escapes.
 // There is only one rule: only annotated versions in the table are replaced. A whole-string hit is replaced with the text box version; a whole string not in the table but containing annotated versions from the table (spliced into a longer sentence) gets those segments replaced; everything else is left untouched, not one byte changed.
 #include "dm_textbox_core.h"
 #include <stdint.h>

@@ -4,6 +4,13 @@ DM_ROOT ?= $(HOME)/dm-work
 PY ?= $(DM_ROOT)/build/cache/dm/venv/bin/python
 EXEFS ?= $(DM_ROOT)/data/switch/3.3.94012/Update/ExeFS
 B = build
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+GC_SECTIONS_LDFLAGS ?= -Wl,-dead_strip
+else
+GC_SECTIONS_LDFLAGS ?= -Wl,--gc-sections
+endif
+PORTABLE_TESTS = $(B)/t_doorspot $(B)/t_hud_dead $(B)/t_modetx $(B)/t_movie $(B)/t_namegen $(B)/t_oe $(B)/t_padmap $(B)/t_rwlv $(B)/t_swkbd $(B)/t_textbox $(B)/t_touch $(B)/t_unit_level $(B)/t_widget
 MOVIE_PACKAGES = libavformat libavcodec libavutil libswscale
 MOVIE_TEST_FLAGS ?= -O1
 .PHONY: movie-real
@@ -96,36 +103,51 @@ run: \
 	for m in en zh none sysen syses systw sysru tags game; do TMPDIR="$(abspath $(B))" $(B)/t_i18n $$m || exit 1; done
 	$(PY) movie_cut.py $(B)/main.orig.bin $(B)/subsdk0.orig.bin
 	$(PY) oe_notify.py $(B)/main.orig.bin
+.PHONY: portable
+# Portable C/Python tests: no Xcode, Apple SDKs, original ExeFS/RomFS, or FFmpeg development packages.
+portable:
+	$(MAKE) --no-print-directory -B $(PORTABLE_TESTS) CC="$(CC) -DDM_TEST_PORTABLE"
+	@set -eu; \
+	python3 native_write_scan.py --selftest ..; \
+	python3 widget_cache_scan.py --selftest ..; \
+	python3 mode_scan.py ../..; \
+	python3 ../../ios/tools/dm_i18n.py --check; \
+	python3 ../../i18n/scan_literals.py; \
+	CC="$(firstword $(CC))" python3 test_mac_features.py; \
+	$(B)/t_textbox; $(B)/t_rwlv; $(B)/t_touch; \
+	$(B)/t_oe; $(B)/t_swkbd; $(B)/t_movie; \
+	$(B)/t_hud_dead; $(B)/t_namegen; \
+	$(B)/t_modetx; $(B)/t_padmap; $(B)/t_unit_level; $(B)/t_widget; $(B)/t_doorspot
 $(B)/t_i18n: t_i18n.c ../dm_i18n.c ../dm_i18n.h ../dm_i18n_tab.h | $(B)
-	clang -O1 -Wall -Werror -I.. -o $@ t_i18n.c ../dm_i18n.c
+	$(CC) -O1 -Wall -Werror -I.. -o $@ t_i18n.c ../dm_i18n.c
 $(B)/t_mac_overlay: t_mac_overlay.m ../app_mac_overlay.h | $(B)
 	clang -O1 -Wall -Werror -fobjc-arc -framework Foundation -o $@ t_mac_overlay.m
 $(B)/t_hud_dead: t_hud_dead.c ../dm_hud.h | $(B)
-	clang -O1 -Wall -Werror -I.. -o $@ t_hud_dead.c
+	$(CC) -O1 -Wall -Werror -I.. -o $@ t_hud_dead.c
 $(B)/t_textbox: t_textbox.c ../dm_textbox_core.c ../dm_textbox_core.h | $(B)
-	clang -O1 -Wall -Werror -o $@ t_textbox.c ../dm_textbox_core.c
+	$(CC) -O1 -Wall -Werror -o $@ t_textbox.c ../dm_textbox_core.c
 $(B)/t_rwlv: t_rwlv.c ../dm_rwlv_core.c ../dm_rwlv_core.h | $(B)
-	clang -O1 -Wall -Werror -o $@ t_rwlv.c ../dm_rwlv_core.c
+	$(CC) -O1 -Wall -Werror -o $@ t_rwlv.c ../dm_rwlv_core.c
 $(B)/t_doorspot: t_doorspot.c ../dm_doorspot.h | $(B)
-	clang -O1 -Wall -Werror -I.. -o $@ t_doorspot.c
+	$(CC) -O1 -Wall -Werror -I.. -o $@ t_doorspot.c
 $(B)/t_widget: t_widget.c ../dm_widget.h | $(B)
-	clang -O1 -Wall -Werror -I.. -o $@ t_widget.c
+	$(CC) -O1 -Wall -Werror -I.. -o $@ t_widget.c
 $(B)/t_unit_level: t_unit_level.c ../dm_unit.h | $(B)
-	clang -O1 -Wall -Werror -I.. -o $@ t_unit_level.c
+	$(CC) -O1 -Wall -Werror -I.. -o $@ t_unit_level.c
 $(B)/t_padmap: t_padmap.c ../dm_padmap.h ../dm_input.h | $(B)
-	clang -O1 -Wall -Werror -o $@ t_padmap.c
+	$(CC) -O1 -Wall -Werror -o $@ t_padmap.c
 $(B)/t_minimap_lift: t_minimap_lift.c ../dm_cursor.c ../dm_cursor.h | $(B)
-	clang -O1 -Wall -Werror -Wno-unused-function -I.. -Wl,-dead_strip -o $@ t_minimap_lift.c
+	$(CC) -O1 -Wall -Werror -Wno-unused-function -ffunction-sections -fdata-sections -I.. $(GC_SECTIONS_LDFLAGS) -o $@ t_minimap_lift.c
 $(B)/t_modetx: t_modetx.c ../dm_modetx.h | $(B)
-	clang -O1 -Wall -Werror -o $@ t_modetx.c
+	$(CC) -O1 -Wall -Werror -o $@ t_modetx.c
 $(B)/t_namegen: t_namegen.c ../dm_namegen.c | $(B)
-	clang -O1 -Wall -Werror -o $@ t_namegen.c ../dm_namegen.c
+	$(CC) -O1 -Wall -Werror -o $@ t_namegen.c ../dm_namegen.c
 $(B)/t_cloudsync: t_cloudsync.c ../dm_cloudsync.c ../dm.h | $(B)
-	clang -O1 -Wall -Werror -I.. -o $@ t_cloudsync.c ../dm_cloudsync.c
+	$(CC) -O1 -Wall -Werror -I.. -o $@ t_cloudsync.c ../dm_cloudsync.c
 $(B)/t_touch: t_touch.c ../hle_touch.c ../front.h ../dm.h | $(B)
-	clang -O1 -Wno-unused-function -I.. -o $@ t_touch.c ../hle_touch.c
+	$(CC) -O1 -Wno-unused-function -I.. -o $@ t_touch.c ../hle_touch.c
 $(B)/t_fs: t_fs.c t_fs_stub.c ../hle_fs.c ../hle.h ../dm.h ../dm_i18n.c | $(B)
-	clang -O1 -Wno-unused-function -I.. -o $@ t_fs.c t_fs_stub.c ../dm_i18n.c
+	$(CC) -O1 -Wno-unused-function -I.. -o $@ t_fs.c t_fs_stub.c ../dm_i18n.c
 $(B)/t_audio: t_audio.c ../hle_audio.c ../hle.h ../dm.h | $(B)
 	clang -O1 -Wno-unused-function -I.. -o $@ t_audio.c -framework AudioToolbox -framework CoreAudio -framework CoreFoundation
 $(B)/t_audio_spsc: t_audio_spsc.c ../hle_audio.c ../hle.h ../dm.h | $(B)
@@ -133,15 +155,15 @@ $(B)/t_audio_spsc: t_audio_spsc.c ../hle_audio.c ../hle.h ../dm.h | $(B)
 $(B)/t_audio_spsc_tsan: t_audio_spsc.c ../hle_audio.c ../hle.h ../dm.h | $(B)
 	clang -O1 -g -O1 -fsanitize=thread -Wno-unused-function -I.. -o $@ t_audio_spsc.c -framework AudioToolbox -framework CoreAudio -framework CoreFoundation
 $(B)/t_swkbd: t_swkbd.c ../hle_swkbd.c ../hle.h ../dm.h | $(B)
-	clang -O1 -Wno-unused-function -I.. -o $@ t_swkbd.c ../hle_swkbd.c
+	$(CC) -O1 -Wno-unused-function -I.. -o $@ t_swkbd.c ../hle_swkbd.c
 $(B)/t_movie: t_movie.c ../hle_movie.c ../hle.h ../dm.h | $(B)
-	clang -O1 -Wno-unused-function -I.. -o $@ t_movie.c ../hle_movie.c
+	$(CC) -O1 -Wno-unused-function -I.. -o $@ t_movie.c ../hle_movie.c
 $(B)/t_movie_real: t_movie_real.c ../hle_movie.c ../dm_movie_decode.c ../dm_movie_decode.h ../hle.h ../dm.h | $(B)
 	clang $(MOVIE_TEST_FLAGS) -Wall -Wno-unused-function -DDM_MOVIE_FFMPEG=1 -I.. -o $@ t_movie_real.c ../dm_movie_decode.c $(shell pkg-config --cflags --libs $(MOVIE_PACKAGES))
 movie-real: $(B)/t_movie_real
 	$(PY) movie_real.py $(B)/t_movie_real
 $(B)/t_altstack: t_altstack.c t_altstack_stub.c ../crash.c ../dm.h | $(B)
-	clang -O1 -Wno-unused-function -I.. -o $@ t_altstack.c t_altstack_stub.c ../crash.c
+	$(CC) -O1 -Wno-unused-function -I.. -o $@ t_altstack.c t_altstack_stub.c ../crash.c
 $(B)/%.orig.bin: $(EXEFS)/% | $(B)
 	$(PY) ../../tools/nso.py $< $@ > /dev/null
 $(B):
@@ -150,46 +172,46 @@ $(B):
 tsan: $(B)/t_audio_spsc_tsan
 	$(B)/t_audio_spsc_tsan
 $(B)/t_condvar: t_condvar.c t_condvar_stub.c ../hle_thread.c ../dm.h | $(B)
-	clang -O1 -Wno-unused-function -DDM_TEST_HOOKS -I.. -o $@ t_condvar.c t_condvar_stub.c ../hle_thread.c
+	$(CC) -O1 -Wno-unused-function -DDM_TEST_HOOKS -I.. -o $@ t_condvar.c t_condvar_stub.c ../hle_thread.c
 $(B)/t_condvar_old: t_condvar.c t_condvar_stub.c ../hle_thread.c ../dm.h | $(B)
-	clang -O1 -Wno-unused-function -DDM_TEST_HOOKS -DDM_TEST_CV_OLD_ORDER -I.. -o $@ t_condvar.c t_condvar_stub.c ../hle_thread.c
+	$(CC) -O1 -Wno-unused-function -DDM_TEST_HOOKS -DDM_TEST_CV_OLD_ORDER -I.. -o $@ t_condvar.c t_condvar_stub.c ../hle_thread.c
 
 $(B)/t_fs_case: t_fs_case.c ../hle_fs.c ../hle.h ../dm.h ../dm_i18n.c | $(B)
-	clang -O1 -Wno-unused-function -I.. -o $@ t_fs_case.c ../dm_i18n.c
+	$(CC) -O1 -Wno-unused-function -I.. -o $@ t_fs_case.c ../dm_i18n.c
 $(B)/t_romfs_validate: t_romfs_validate.c ../romfs_validate.c ../romfs_validate.h ../dm_i18n.c ../dm_i18n_tab.h | $(B)
-	clang -O1 -Wno-unused-function -I.. -o $@ t_romfs_validate.c ../romfs_validate.c ../dm_i18n.c
+	$(CC) -O1 -Wno-unused-function -I.. -o $@ t_romfs_validate.c ../romfs_validate.c ../dm_i18n.c
 
 $(B)/t_hid_script: t_hid_script.c t_touch_tick_stub.c ../hle_hid.c ../dm_cursor.c ../dm_hud.c ../dm_hud.h ../touch_mac.c ../../ios/Sources/dm_touch_controls.c ../hle.h ../dm.h ../dm_input.h ../front.h | $(B) ../dm_prof.c
-	clang -O1 -Wno-unused-function -I.. -I../../ios/Sources -o $@ t_hid_script.c t_touch_tick_stub.c ../dm_cursor.c ../dm_hud.c ../touch_mac.c ../../ios/Sources/dm_touch_controls.c -lm ../dm_prof.c
+	$(CC) -O1 -Wno-unused-function -I.. -I../../ios/Sources -o $@ t_hid_script.c t_touch_tick_stub.c ../dm_cursor.c ../dm_hud.c ../touch_mac.c ../../ios/Sources/dm_touch_controls.c -lm ../dm_prof.c
 
 $(B)/t_oe: t_oe.c ../hle_oe.c ../hle.h ../dm.h | $(B)
-	clang -O1 -Wno-unused-function -I.. -o $@ t_oe.c
+	$(CC) -O1 -Wno-unused-function -DDM_TEST_PORTABLE -DTARGET_OS_IPHONE=1 -I.. -o $@ t_oe.c -pthread
 
 $(B)/t_hid_receipt: t_hid_receipt.c t_touch_tick_stub.c ../hle_hid.c ../dm_cursor.c ../dm_hud.c ../dm_hud.h ../touch_mac.c ../../ios/Sources/dm_touch_controls.c ../hle.h ../dm.h ../dm_input.h ../front.h | $(B) ../dm_prof.c
-	clang -O1 -Wno-unused-function -I.. -I../../ios/Sources -o $@ t_hid_receipt.c t_touch_tick_stub.c ../dm_cursor.c ../dm_hud.c ../touch_mac.c ../../ios/Sources/dm_touch_controls.c -lm ../dm_prof.c
+	$(CC) -O1 -Wno-unused-function -I.. -I../../ios/Sources -o $@ t_hid_receipt.c t_touch_tick_stub.c ../dm_cursor.c ../dm_hud.c ../touch_mac.c ../../ios/Sources/dm_touch_controls.c -lm ../dm_prof.c
 $(B)/t_touch_mac: t_touch_mac.c ../touch_mac.c ../dm_cursor.c ../dm_hud.c ../dm_hud.h ../../ios/Sources/dm_touch_controls.c ../../ios/Sources/dm_touch_controls.h ../../host/dm_input.h | $(B)   # 测试 #include 了 touch_mac.c 与 dm_touch_controls.c，须列为依赖（漏列致改源不重编） ../dm_prof.c | The tests #include touch_mac.c and dm_touch_controls.c, so they must be listed as dependencies (missing them means editing the source does not trigger a rebuild) ../dm_prof.c
-	clang -std=c11 -Wall -Wextra -Werror -I.. -I../../ios/Sources -o $@ t_touch_mac.c ../dm_cursor.c ../dm_hud.c -lm ../dm_prof.c
+	$(CC) -std=c11 -Wall -Wextra -Werror -I.. -I../../ios/Sources -o $@ t_touch_mac.c ../dm_cursor.c ../dm_hud.c -lm ../dm_prof.c
 $(B)/t_target_rank: t_target_rank.c ../hle_target.c ../dm.h | $(B)
-	clang -O1 -Wno-unused-function -I.. -o $@ t_target_rank.c ../hle_target.c
+	$(CC) -O1 -Wno-unused-function -I.. -o $@ t_target_rank.c ../hle_target.c
 $(B)/t_rift_clock: t_rift_clock.c ../dm_rift.c ../dm_rift.h ../hle_os.c ../hle.h ../dm.h | $(B)
-	clang -O1 -Wall -Wno-unused-function -ffunction-sections -fdata-sections -Wl,-dead_strip -I.. -o $@ t_rift_clock.c ../hle_os.c
+	$(CC) -O1 -Wall -Wno-unused-function -ffunction-sections -fdata-sections $(GC_SECTIONS_LDFLAGS) -I.. -o $@ t_rift_clock.c ../hle_os.c
 $(B)/t_rift_next: t_rift_next.c ../dm_rift.c ../dm_rift.h ../hle_os.c ../hle.h ../dm.h | $(B)
-	clang -O1 -Wall -Wno-unused-function -ffunction-sections -fdata-sections -Wl,-dead_strip -I.. -o $@ t_rift_next.c ../hle_os.c
+	$(CC) -O1 -Wall -Wno-unused-function -ffunction-sections -fdata-sections $(GC_SECTIONS_LDFLAGS) -I.. -o $@ t_rift_next.c ../hle_os.c
 $(B)/t_rift_oldrun: t_rift_oldrun.c ../dm_rift.c ../dm_rift.h ../hle_os.c ../hle.h ../dm.h | $(B)
-	clang -O1 -Wall -Wno-unused-function -ffunction-sections -fdata-sections -Wl,-dead_strip -I.. -o $@ t_rift_oldrun.c ../hle_os.c
+	$(CC) -O1 -Wall -Wno-unused-function -ffunction-sections -fdata-sections $(GC_SECTIONS_LDFLAGS) -I.. -o $@ t_rift_oldrun.c ../hle_os.c
 $(B)/t_rift_wave: t_rift_wave.c ../dm_rift.c ../dm_rift.h ../hle_os.c ../hle.h ../dm.h | $(B)
-	clang -O1 -Wall -Wno-unused-function -ffunction-sections -fdata-sections -Wl,-dead_strip -I.. -o $@ t_rift_wave.c ../hle_os.c
+	$(CC) -O1 -Wall -Wno-unused-function -ffunction-sections -fdata-sections $(GC_SECTIONS_LDFLAGS) -I.. -o $@ t_rift_wave.c ../hle_os.c
 $(B)/t_thread_leak: t_thread_leak.c ../thread.c ../dm.h | $(B)
-	clang -O1 -Wall -Wno-unused-function -I.. -I../../ios/Sources -o $@ t_thread_leak.c
+	$(CC) -O1 -Wall -Wno-unused-function -I.. -I../../ios/Sources -o $@ t_thread_leak.c
 
 $(B)/t_interaction_diag: t_interaction_diag.c ../dm_world.c ../dm_unit.h ../touch_mac.h | $(B)
-	clang -O1 -Wno-unused-function -Wl,-dead_strip -I.. -o $@ t_interaction_diag.c
+	$(CC) -O1 -Wno-unused-function -ffunction-sections -fdata-sections $(GC_SECTIONS_LDFLAGS) -I.. -o $@ t_interaction_diag.c
 
 $(B)/t_map_diag: t_map_diag.c ../dm_cursor.c ../dm_unit.h | $(B)
-	clang -O1 -Wno-unused-function -Wl,-dead_strip -I.. -o $@ t_map_diag.c
+	$(CC) -O1 -Wno-unused-function -ffunction-sections -fdata-sections $(GC_SECTIONS_LDFLAGS) -I.. -o $@ t_map_diag.c
 
 $(B)/t_warp_diag: t_warp_diag.c ../dm_rift.c ../dm_unit.h | $(B)
-	clang -O1 -Wno-unused-function -Wl,-dead_strip -I.. -o $@ t_warp_diag.c
+	$(CC) -O1 -Wno-unused-function -ffunction-sections -fdata-sections $(GC_SECTIONS_LDFLAGS) -I.. -o $@ t_warp_diag.c
 
 $(B)/t_loader_weak: t_loader_weak.c ../loader.c ../hle.c ../dm.h ../hle.h | $(B)
-	clang -O1 -Wno-deprecated-declarations -I.. -Wl,-dead_strip -o $@ t_loader_weak.c ../hle.c
+	$(CC) -O1 -Wno-deprecated-declarations -ffunction-sections -fdata-sections -I.. $(GC_SECTIONS_LDFLAGS) -o $@ t_loader_weak.c ../hle.c
