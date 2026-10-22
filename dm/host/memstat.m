@@ -21,6 +21,8 @@
 #include <TargetConditionals.h>
 #include <mach/mach.h>
 #include <mach/vm_statistics.h>
+#include <stdatomic.h>
+#include <stdlib.h>
 #if TARGET_OS_IPHONE
 #include <os/proc.h>
 #endif
@@ -99,28 +101,50 @@ static void sample(FILE *f, double t, id<MTLDevice> dev) {
 }
 
 static void *memstat_thread(void *p) {
-    FILE *f = fopen((const char *)p, "w");
-    if (!f) { LOG("memstat：打不开 %s", (const char *)p); return NULL; }
+    pthread_setname_np("dm-memstat");
+    char path[1024]; int iv = 1; const char *spec = (const char *)p; const char *comma = strchr(spec, ',');
+    snprintf(path, sizeof path, "%.*s", comma ? (int)(comma - spec) : (int)strlen(spec), spec);
+    if (comma) iv = atoi(comma + 1);
+    free(p);
+    if (iv < 1) iv = 1;
+    if (iv > 300) iv = 300;
+    FILE *f = fopen(path, "w");
+    if (!f) { LOG("memstat：打不开 %s", path); return NULL; }
     fprintf(f, "# 单位 MiB；内核记账 internal / compressed / 图形 ledger / 距上限；类别列 = 虚拟/常驻/计费（按对象去重）；计费合计 = Σ私有计费；未归属 = phys_footprint − 计费合计\n秒\tphys_footprint\t可用\tmetal_alloc\tinternal\tcompressed\tgraphics\t距上限");
     for (int c = 0; c < NC; c++) fprintf(f, "\t%s", k_cls[c]);
     fprintf(f, "\t计费合计\t未归属\n");
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();   // 与图形后端同一设备对象（系统缺省设备单例） | The same device object as the graphics backend (the system default device singleton)
     uint64_t t0 = now_ns();
     const char *ds = getenv("DM_MEMSTAT_DUMP"); int dump_at = ds ? atoi(ds) : -1;
-    char dp[1100]; snprintf(dp, sizeof dp, "%s.regions", (const char *)p);
-    for (int sec = 0;; sec++) { sample(f, (now_ns() - t0) / 1e9, dev); if (sec == dump_at) dump_regions(dp); sleep(1); }
+    char dp[1100]; snprintf(dp, sizeof dp, "%s.regions", path);
+    for (int elapsed = 0, dumped = 0;;) {
+        sample(f, (now_ns() - t0) / 1e9, dev);
+        if (!dumped && dump_at >= 0 && elapsed >= dump_at) { dump_regions(dp); dumped = 1; }
+        sleep(iv); elapsed += iv;
+    }
     return NULL;
 }
 
-__attribute__((constructor)) static void memstat_start(void) {
+static _Atomic int g_memstat_started;
+void dm_memstat_start_configured(void) {
     const char *p = getenv("DM_MEMSTAT");
     if (!p || !*p) return;
+    int expected = 0; if (!atomic_compare_exchange_strong(&g_memstat_started, &expected, 1)) return;
     char *path = strdup(p);
 #if TARGET_OS_IPHONE
-    if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; path = malloc(n); snprintf(path, n, "%s/Documents/%s", getenv("HOME"), p); }   // 相对名 → 容器 Documents（启动前不知容器路径） | Relative name → the container's Documents (the container path is not known before launch)
+    if (*p != '/') {
+        const char *home = getenv("HOME"); if (!home) home = "";
+        const char *comma = strchr(p, ','); size_t base_len = comma ? (size_t)(comma - p) : strlen(p);
+        size_t n = strlen(home) + base_len + (comma ? strlen(comma) : 0) + 16; char *full = malloc(n);
+        if (full) { snprintf(full, n, "%s/Documents/%.*s%s", home, (int)base_len, p, comma ? comma : ""); free(path); path = full; }
+        else { free(path); path = NULL; }
+    }
 #endif
-    pthread_t th; pthread_create(&th, NULL, memstat_thread, path); pthread_detach(th);
+    if (!path) { atomic_store(&g_memstat_started, 0); return; }
+    pthread_t th; if (pthread_create(&th, NULL, memstat_thread, path)) { free(path); atomic_store(&g_memstat_started, 0); return; }
+    pthread_detach(th);
 }
+__attribute__((constructor)) static void memstat_start(void) { dm_memstat_start_configured(); }
 
 // ---------- 按线程 CPU：DM_THRCPU=<tsv 路径>[,间隔秒（缺省 10）]（Mac / iOS 通用；iOS 相对名 → 容器 Documents）----------
 // 每个间隔遍历本进程全部线程（task_threads），THREAD_EXTENDED_INFO 取线程名与用户 + 系统 CPU 时间（ns），按线程号差分：
@@ -131,7 +155,10 @@ __attribute__((constructor)) static void memstat_start(void) {
 #include <mach/thread_info.h>
 #define THR_MAX 512
 static void *thrcpu_thread(void *p) {
+    pthread_setname_np("dm-thrcpu");
     char path[1024]; int iv = 10; { const char *c = strchr((const char *)p, ','); snprintf(path, sizeof path, "%.*s", c ? (int)(c - (const char *)p) : (int)strlen(p), (const char *)p); if (c) iv = atoi(c + 1); }
+    free(p);
+    if (iv < 1) iv = 1; if (iv > 300) iv = 300;
     FILE *f = fopen(path, "w"); if (!f) return NULL;
     fprintf(f, "秒\t线程号\t线程名\tCPU%%\n"); fflush(f);
     static uint64_t ids[THR_MAX], last[THR_MAX]; int n = 0; uint64_t t0 = now_ns(), tl = t0;
@@ -157,12 +184,22 @@ static void *thrcpu_thread(void *p) {
     }
     return NULL;
 }
-__attribute__((constructor)) static void thrcpu_start(void) {
+static _Atomic int g_thrcpu_started;
+void dm_thrcpu_start_configured(void) {
     const char *p = getenv("DM_THRCPU");
     if (!p || !*p) return;
+    int expected = 0; if (!atomic_compare_exchange_strong(&g_thrcpu_started, &expected, 1)) return;
     char *spec = strdup(p);
 #if TARGET_OS_IPHONE
-    if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; spec = malloc(n); snprintf(spec, n, "%s/Documents/%s", getenv("HOME"), p); }
+    if (*p != '/') {
+        const char *home = getenv("HOME"); if (!home) home = "";
+        size_t n = strlen(home) + strlen(p) + 16; char *full = malloc(n);
+        if (full) { snprintf(full, n, "%s/Documents/%s", home, p); free(spec); spec = full; }
+        else { free(spec); spec = NULL; }
+    }
 #endif
-    pthread_t th; pthread_create(&th, NULL, thrcpu_thread, spec); pthread_detach(th);
+    if (!spec) { atomic_store(&g_thrcpu_started, 0); return; }
+    pthread_t th; if (pthread_create(&th, NULL, thrcpu_thread, spec)) { free(spec); atomic_store(&g_thrcpu_started, 0); return; }
+    pthread_detach(th);
 }
+__attribute__((constructor)) static void thrcpu_start(void) { dm_thrcpu_start_configured(); }

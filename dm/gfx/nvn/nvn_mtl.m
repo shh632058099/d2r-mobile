@@ -1647,6 +1647,7 @@ static int g_pg_copen = -1;   // 计算通道：开着的那个的结束采样�
 static int g_pg_b; static uint32_t g_pg_used;
 static pg_pass *g_pg_pass; static int g_pg_np, g_pg_cap, g_pg_open = -1;
 static uint64_t g_pg_frame = ~0ull; static int g_pg_idx;
+static int g_pg_every = 1, g_pg_sample = 1;
 static pthread_mutex_t g_pg_mu = PTHREAD_MUTEX_INITIALIZER;
 static inline void args_dirty_all(void);
 typedef struct { double sum, last; uint64_t n; pg_pass meta; } pg_stat;
@@ -1655,6 +1656,8 @@ static int pg_on(void) {
     if (g_pg >= 0) return g_pg;
     const char *e = getenv("DM_NVN_PASSGPU"); g_pg = 0;
     if (!e) return 0;
+    const char *ev = getenv("DM_NVN_PASSGPU_EVERY"); if (ev) { int n = atoi(ev); if (n >= 1 && n <= 120) g_pg_every = n; }
+    MLOG("[passgpu] 逐通道计时采样间隔：每 %d 次提交", g_pg_every);
 #if DM_NVN_M3
     if (![g_dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) { MLOG("【红】DM_NVN_PASSGPU：本设备不支持阶段边界计数采样"); return 0; }
     id<MTLCounterSet> ts = nil; for (id<MTLCounterSet> c in g_dev.counterSets) if ([c.name isEqualToString:MTLCommonCounterSetTimestamp]) ts = c;
@@ -1672,13 +1675,19 @@ static int pg_on(void) {
     MLOG("[passgpu] 逐通道 GPU 计时 → %s", e);
     return g_pg = 1;
 }
-static void pg_sub_begin(uint64_t fence) {   // 本次提交用环里第 fence % PG_RING 块；先等 PG_RING 次之前用它的提交完成 | This submission uses block fence % PG_RING of the ring; first wait for the submission that used it PG_RING submissions ago to complete
+static void pg_sub_begin(uint64_t fence) {   // 环按提交栅栏索引；稀疏采样时非采样提交不等待 GPU、不写时间戳 | Ring is indexed by submit fence; non-sampled submits neither wait for GPU nor write timestamps
     if (!pg_on()) return;
+    g_pg_sample = g_pg_every <= 1 || fence % (uint64_t)g_pg_every == 0;
+    g_pg_used = 0; g_pg_np = 0; g_pg_open = -1;
+#if !DM_NVN_M3
+    g_pg_copen = -1;
+#endif
+    if (!g_pg_sample) return;
     if (fence > PG_RING) mtl_wait(fence - PG_RING, UINT64_MAX);
-    g_pg_b = (int)(fence % PG_RING); g_pg_used = 0; g_pg_np = 0; g_pg_open = -1;
+    g_pg_b = (int)(fence % PG_RING);
 }
 static pg_pass *pg_new(int kind, int nslot) {
-    if (!pg_on() || g_pg_used + nslot > PG_SLOTS) return NULL;
+    if (!pg_on() || !g_pg_sample || g_pg_used + nslot > PG_SLOTS) return NULL;
     uint64_t f = atomic_load(&g_cur_frame); if (f != g_pg_frame) { g_pg_frame = f; g_pg_idx = 0; }
     if (g_pg_np == g_pg_cap) { g_pg_cap = g_pg_cap ? g_pg_cap * 2 : 128; g_pg_pass = realloc(g_pg_pass, g_pg_cap * sizeof *g_pg_pass); }
     pg_pass *p = &g_pg_pass[g_pg_np++]; memset(p, 0, sizeof *p);

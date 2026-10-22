@@ -697,6 +697,32 @@ static void boot_prepare(void) {
     setenv("DM_TEMP", [doc stringByAppendingPathComponent:@"temp"].fileSystemRepresentation, 0);
     setenv("DM_NVN_SHMAP", [res stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation, 0);
     setenv("DM_MSL_DIR", [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"msl"].fileSystemRepresentation, 0);
+    // 完整性能诊断只需在 Documents 放 diagnostics.enable；普通运行默认关闭。
+    // Full performance diagnostics are opt-in via Documents/diagnostics.enable; disabled in normal play.
+    BOOL fullDiagnostics = [fm fileExistsAtPath:[doc stringByAppendingPathComponent:@"diagnostics.enable"]];
+    BOOL passGpuOnly = [fm fileExistsAtPath:[doc stringByAppendingPathComponent:@"passgpu.enable"]];
+    if (fullDiagnostics || passGpuOnly) {
+        NSString *out = [doc stringByAppendingPathComponent:@"passgpu.tsv"];
+        setenv("DM_NVN_PASSGPU", out.fileSystemRepresentation, 1);
+        setenv("DM_NVN_PASSGPU_EVERY", fullDiagnostics ? "10" : "1", 1);
+        plog("boot: 逐通道 GPU 诊断已开启，结果 passgpu.tsv；每 %s 次提交采样", fullDiagnostics ? "10" : "1");
+    }
+    if (fullDiagnostics) {
+        NSString *frames = [doc stringByAppendingPathComponent:@"frames.tsv"];
+        setenv("DM_NVN_TSV", frames.fileSystemRepresentation, 1);
+        setenv("DM_NVN_TSV_CALLS", "0", 1);   // 只记逐帧指标，不写数百个函数计数，控制文件体积
+        setenv("DM_SLOWFRAME", "1", 1);
+        setenv("DM_HEAT", "heat.tsv,10", 1);
+        setenv("DM_THRCPU", "threads.tsv,10", 1);
+        setenv("DM_MEMSTAT", "memory.tsv,5", 1);
+        setenv("DM_MEM_STAT_ALL", "1", 1);
+        setenv("DM_RES_CENSUS", "1", 1);
+        extern void dm_thrcpu_start_configured(void);
+        extern void dm_memstat_start_configured(void);
+        dm_thrcpu_start_configured();   // 构造函数执行时环境变量尚未设置，因此在这里显式启动线程 CPU 采样
+        dm_memstat_start_configured();  // VM 分区内存记账每 5 秒采样一次，避免每秒扫描的高开销
+        plog("boot: 完整性能诊断开启：frames.tsv / heat.tsv / threads.tsv / memory.tsv / passgpu.tsv；Metal 对象细分和 VM 内存扫描会增加开销");
+    }
     // 工作目录设成 Documents：环境变量里的相对路径（DM_TICKS / DM_C2S_REPLAY / DM_C2S_LOG / DM_NVN_SHOT 的名字部分等）都落在这里（容器路径启动前不可知）
     // Set the working directory to Documents: relative paths in environment variables (DM_TICKS / DM_C2S_REPLAY / DM_C2S_LOG / the name part of DM_NVN_SHOT, etc.) all land here (the container path is not known before launch)
     if (chdir(doc.fileSystemRepresentation)) plog("boot: 🔴 chdir Documents 失败 %s", strerror(errno));
