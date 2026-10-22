@@ -22,6 +22,7 @@ ios/Sources/dm_update.m	*	查更新失败原因 / 网络路径状态，只进日
 ios/Sources/cloud_ios.m	*	iCloud 同步日志
 host/diag.c	@res_report	资源读数日志标签
 host/diag.c	@crash_watch_progress	看门狗进展标签，只进日志
+host/diag.c	# 时刻	perf.txt 表头，只写性能诊断文件
 host/diag.c	RomFS读	卡顿分类表（日志）
 host/diag.c	锁等	卡顿分类表（日志）
 host/diag.c	条件变量等	卡顿分类表（日志）

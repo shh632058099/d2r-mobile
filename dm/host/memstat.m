@@ -203,7 +203,16 @@ static void *thrcpu_thread(void *p) {
                 else if (k < n) { double pct = (cpu - last[k]) / 1e9 / dt * 100; last[k] = cpu; tot += pct;
                     if (pct >= 0.5) { char gn[96], pc[192] = "-"; int thr_name_of(pthread_t, char *, size_t); pthread_t pt = pthread_from_mach_thread_np(th[i]);
                         int guest_named = pt && thr_name_of(pt, gn, sizeof gn); const char *nm = guest_named ? gn : ei.pth_name[0] ? ei.pth_name : "-";   // 客体线程：句柄 + 客体名；宿主线程：pthread 名 | Guest thread: handle + guest name; host thread: pthread name
-                        if (!guest_named && !ei.pth_name[0] && pct >= 5.0) thrcpu_pc(th[i], pc, sizeof pc); // 只对高占用未命名线程取一次 PC，避免普通采样开销
+                        if (!guest_named && !ei.pth_name[0] && pct >= 5.0) {
+                            thrcpu_pc(th[i], pc, sizeof pc);
+                            // 单个 PC 易碰巧停在 mach_msg；对 CPU>20% 的无名线程再隔 2ms 取两次，诊断模式才开启。
+                            if (pct >= 20.0) {
+                                char a[96], b[96]; usleep(2000); thrcpu_pc(th[i], a, sizeof a);
+                                usleep(2000); thrcpu_pc(th[i], b, sizeof b);
+                                size_t used = strlen(pc);
+                                if (used < sizeof pc) snprintf(pc + used, sizeof pc - used, " | %s | %s", a, b);
+                            }
+                        }
                         fprintf(f, "%.0f\t%llu\t%s\t%.1f\t%s\n", (t - t0) / 1e9, ii.thread_id, nm, pct, pc); } }
             }
             mach_port_deallocate(mach_task_self(), th[i]);

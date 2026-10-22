@@ -708,9 +708,14 @@ static void boot_prepare(void) {
         plog("boot: 逐通道 GPU 诊断已开启，结果 passgpu.tsv；每 %s 次提交采样", fullDiagnostics ? "10" : "1");
     }
     if (fullDiagnostics) {
-        // 只在稳定高负载窗口采集详细附件 / Shader 关联，避免整局逐通道 dump 放大诊断开销。
-        setenv("DM_NVN_PASSDUMP", "6000-6100", 1);
-        plog("boot: RenderPass 详细关联诊断开启：仅帧 6000–6100 写入 boot.txt（DM_NVN_PASSDUMP_ALL 未开启）");
+        // 详细附件/Shader dump 会显著拖慢提交线程；需要时另放 passdump.enable 才采 3 帧。
+        // Heavy pass dump must be explicitly opted in, independently of the ordinary diagnostics marker.
+        if ([fm fileExistsAtPath:[doc stringByAppendingPathComponent:@"passdump.enable"]]) {
+            setenv("DM_NVN_PASSDUMP", "6000-6002", 1);
+            plog("boot: 高开销 RenderPass 附件/Shader dump 开启：仅帧 6000–6002；本次不能用于性能对照");
+        } else {
+            unsetenv("DM_NVN_PASSDUMP");
+        }
         NSString *frames = [doc stringByAppendingPathComponent:@"frames.tsv"];
         setenv("DM_NVN_TSV", frames.fileSystemRepresentation, 1);
         setenv("DM_NVN_TSV_CALLS", "0", 1);   // 只记逐帧指标，不写数百个函数计数，控制文件体积

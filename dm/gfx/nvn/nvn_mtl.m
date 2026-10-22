@@ -2304,6 +2304,7 @@ static int g_warm_started;
 static uint64_t g_warm_t0;
 static _Atomic int g_warm_running;   // 后台预热还没跑完（进局读取画面据此多等一会儿，见 mtl_warm_wait） | Background warm-up has not finished yet (the loading screen on entering a run waits a little longer based on this, see mtl_warm_wait)
 static uint64_t g_warm_shaders, g_warm_rps, g_warm_cps, g_warm_skip_fz;
+static uint64_t g_warm_skip_badkey, g_warm_skip_missing_shader, g_warm_skip_build, g_warm_seen_rps;
 static uint64_t g_warm_claim_shaders, g_warm_claim_rps, g_warm_claim_cps;
 static id<MTLFunction> bf_fn(NvShader *fs, const int *fx, uint8_t fbmask, const uint8_t *lmap);
 static int rt_range_bindings_ro(NSDictionary *j);
@@ -2884,11 +2885,12 @@ static void warm_worker(NSArray<NSString *> *paths) {
                     WarmItem *item = [WarmItem new]; item->kind = 0; item->key = key; item->shader = sh;
                     warm_enqueue(item); g_warm_shaders++;
                 } else if ([c[0] isEqualToString:@"R"] && c.count >= 2) {
-                    pso_skey sk; if (pso_skey_parse(c[1].UTF8String, &sk)) continue;
+                    pso_skey sk; g_warm_seen_rps++;
+                    if (pso_skey_parse(c[1].UTF8String, &sk)) { g_warm_skip_badkey++; continue; }
                     NSString *vkey = warm_key(sk.vs, sizeof sk.vs), *fkey = warm_key(sk.fs, sizeof sk.fs);
                     NvShader *vs = vkey.length ? warm_shader(dict, vkey, sk.vs_stage) : nil;
                     NvShader *fs = fkey.length ? warm_shader(dict, fkey, sk.fs_stage) : nil;
-                    if (!vs || (fkey.length && !fs)) continue;
+                    if (!vs || (fkey.length && !fs)) { g_warm_skip_missing_shader++; continue; }
                     id<MTLFunction> fsfn = nil;
                     if (sk.fz) {
                         if (sk.fz_desc.kind == 1 && fs) { int fx[32]; for (int i = 0; i < 32; i++) fx[i] = sk.fz_desc.fx[i]; fsfn = bf_fn(fs, fx, sk.fz_desc.fbmask, sk.k.lmap); }
@@ -2896,7 +2898,7 @@ static void warm_worker(NSArray<NSString *> *paths) {
                     }
                     pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = (__bridge void *)fsfn;
                     NSError *e = nil; id ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, fs, fsfn, sk.merged) error:&e];
-                    if (!ps) { MLOG("【红】后台建渲染管线失败：%s", e.localizedDescription.UTF8String); continue; }
+                    if (!ps) { g_warm_skip_build++; MLOG("【红】后台建渲染管线失败：%s", e.localizedDescription.UTF8String); continue; }
                     WarmItem *item = [WarmItem new]; item->kind = 1; item->vs_key = vkey; item->fs_key = fkey; item->vs = vs; item->fs = fs; item->fsfn = fsfn; item->pso = k; item->object = ps;
                     warm_enqueue(item); g_warm_rps++;
                 } else if ([c[0] isEqualToString:@"C"] && c.count >= 2) {
@@ -2910,8 +2912,8 @@ static void warm_worker(NSArray<NSString *> *paths) {
                 }
             }
         }
-        MLOG("管线预热完成：着色器 %llu 个 / 渲染管线 %llu 个（跳过特化片元 %llu）/ 计算管线 %llu 个，后台用时 %.1f ms",
-             g_warm_shaders, g_warm_rps, g_warm_skip_fz, g_warm_cps, (bp_now() - g_warm_t0) / 1e6);
+        MLOG("管线预热完成：着色器 %llu 个 / 渲染管线 %llu/%llu 个（跳过特化片元 %llu、无着色器 %llu、无效键 %llu、构建失败 %llu）/ 计算管线 %llu 个，后台用时 %.1f ms",
+             g_warm_shaders, g_warm_rps, g_warm_seen_rps, g_warm_skip_fz, g_warm_skip_missing_shader, g_warm_skip_badkey, g_warm_skip_build, g_warm_cps, (bp_now() - g_warm_t0) / 1e6);
     }
     atomic_store(&g_warm_running, 0);
 }
@@ -2934,9 +2936,12 @@ static void warm_start(void) {
         paths = @[@(e)];
     } else {
         NSString *seed = [g_shmap_path.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"pso_manifest.tsv"];
-        NSMutableArray<NSString *> *all = [NSMutableArray arrayWithObject:seed];
+        NSMutableArray<NSString *> *all = [NSMutableArray array];
         NSString *user = pso_user_path();
+        // 真实游戏过程记录的管线优先于通用种子预热；避免玩家进局后才碰到重型 PSO。
+        // Warm user-observed pipelines first, so expensive gameplay variants are not starved by the generic seed.
         if (user && [NSFileManager.defaultManager fileExistsAtPath:user]) [all addObject:user];
+        [all addObject:seed];
         if (![NSFileManager.defaultManager fileExistsAtPath:seed]) return;
         paths = all;
     }
