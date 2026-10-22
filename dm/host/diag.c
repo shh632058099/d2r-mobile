@@ -1510,6 +1510,22 @@ static void hold_on_uimsg(const char *cat, const char *act, const char *arg) {
 #include <TargetConditionals.h>
 #include <sys/stat.h>
 #include <time.h>
+static const char k_perf_header[] = "# 时刻\t进程秒\t温控\t3D比例\t上屏帧率\t16.7ms档%\t25ms档%\t≥33ms档%\t丢弃帧\t提交CPUms\t场景\n";
+static int g_perf_run_marked, g_perf_started;
+static void perf_write_marker(FILE *fp) {
+    if (ftell(fp) == 0) fputs(k_perf_header, fp);
+    time_t w = time(NULL); struct tm tmv; char ts[32] = "unknown";
+    if (localtime_r(&w, &tmv)) strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tmv);
+    fprintf(fp, "%s\t%s\n", g_perf_started ? "# PERF SEGMENT START" : "# RUN START", ts);
+    g_perf_started = 1;
+}
+static void perf_mark_run(const char *path) {
+    if (!path || g_perf_run_marked) return;
+    struct stat st;
+    if (!stat(path, &st) && st.st_size > 256 * 1024) rename(path, "perf.old.txt");
+    FILE *fp = fopen(path, "a"); if (!fp) return;
+    perf_write_marker(fp); fclose(fp); g_perf_run_marked = 1;
+}
 int dm_thermal_now(void);
 int dm_ingame_now(void) { dm_hud_info h; dm_hud_get(&h); return h.valid; }   // 当前是否在局内（读到受控玩家）：动态 3D 比例只在局内判 | Whether we are in a run right now (the controlled player was read): the dynamic 3D scale is only evaluated in a run
 // ---- 长帧日志：hle_nvn.c 在某帧 > 20 ms（或 GPU > 16.7 ms）时调一次；这里补上「读取画面是否盖着 / 当前面板 / 区域号」，
@@ -1535,13 +1551,15 @@ void dm_perf_present(double iv) {   // 出图线程每帧调一次（滞后 8 �
     if (!init) { init = 1; const char *e = getenv("DM_PERF_FILE"); path = e ? (strcmp(e, "0") ? e : NULL) : (TARGET_OS_IPHONE ? "perf.txt" : NULL); t0 = tstart = now_ns(); f0 = dm_nvn_frame_count(); cpu0 = dm_nvn_sub_cpu_ns(); }
     dm_3d_scale_feed(iv);   // 动态 3D 比例的控制器吃同一份上屏间隔（hle_oe.c） | The dynamic 3D scale controller consumes the same present intervals (hle_oe.c)
     if (!path) return;
+    if (!g_perf_run_marked) perf_mark_run(path);
     if (iv < 0) disc++; else if (iv > 0) { sum += iv; if (iv <= 20.8) c16++; else if (iv <= 29.2) c25++; else c33++; }
     uint64_t now = now_ns(); if (now - t0 < 10000000000ull) return;
     unsigned n = c16 + c25 + c33; uint64_t f = dm_nvn_frame_count(), cpu = dm_nvn_sub_cpu_ns();
-    struct stat st; if (!stat(path, &st) && st.st_size > 256 * 1024) rename(path, "perf.old.txt");
+    struct stat st; if (!stat(path, &st) && st.st_size > 256 * 1024 && rename(path, "perf.old.txt") == 0) g_perf_run_marked = 0;
     FILE *fp = fopen(path, "a");
     if (fp) {
-        if (ftell(fp) == 0) fprintf(fp, "# 时刻\t进程秒\t温控\t3D比例\t上屏帧率\t16.7ms档%%\t25ms档%%\t≥33ms档%%\t丢弃帧\t提交CPUms\t场景\n");
+        if (ftell(fp) == 0) fputs(k_perf_header, fp);
+        if (!g_perf_run_marked) { perf_write_marker(fp); g_perf_run_marked = 1; }
         time_t w = time(NULL); struct tm tmv; localtime_r(&w, &tmv); char ts[16]; strftime(ts, sizeof ts, "%H:%M:%S", &tmv);
         dm_hud_info h; dm_hud_get(&h); char scene[64]; if (h.valid) snprintf(scene, sizeof scene, "局内 区域%d (%d,%d) Lv%d%s", h.area, h.x, h.y, h.level, h.dead ? "(死亡)" : ""); else snprintf(scene, sizeof scene, "菜单");
         fprintf(fp, "%s\t%.0f\t%d\t%.2f\t%.1f\t%.1f\t%.1f\t%.1f\t%u\t%.2f\t%s\n", ts, (now - tstart) / 1e9, dm_thermal_now(), dm_3d_scale_cur(),

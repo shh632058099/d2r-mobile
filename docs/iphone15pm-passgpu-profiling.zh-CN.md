@@ -10,15 +10,15 @@
 
 | 文件 | 内容 |
 |---|---|
-| `boot.txt` | 每 300 帧的 CPU 阶段耗时、线程策略、进程 footprint、Metal 显存分配、纹理/缓冲驻留与退役对象、游戏堆余量和最大可分配块；长帧详情也写这里 |
+| `boot.txt` | 每 300 帧的 CPU 阶段耗时、线程策略、进程 footprint、Metal 分配与资源普查、游戏堆余量和最大可分配块；完整诊断还会把帧 6000–6100 的 RenderPass / 附件 / Shader 关联细节写在这里 |
 | `frames.tsv` | 逐帧帧时间、GPU 时间、CPU 时间、出图等待、RenderPass / Draw、附件读写、上传、管线创建等指标；不记录大量函数调用计数 |
 | `heat.tsv` | 每 10 秒的进程 CPU%、实际 FPS、GPU 均值/P95、温控等级、亮度、电量状态相关信息（电量和充电状态也会写入 `boot.txt`） |
 | `threads.tsv` | 每 10 秒各线程 CPU 占用率及线程名，帮助确认是游戏线程、NVN 翻译线程还是其他线程吃 CPU |
-| `memory.tsv` | 每 5 秒记录 phys_footprint、系统剩余内存、Metal 分配量、internal/compressed/graphics 记账，以及 guest/code/malloc/gpu/stack/file/other 各类 VM 的虚拟、常驻和计费量 |
+| `memory.tsv` | 每 5 秒记录 phys_footprint、系统剩余内存、Metal 分配量和各类 VM 区域估算；区域估算可能重复计数，`footprint差值` 可为负，不能当作真实“未归属内存” |
 | `passgpu.tsv` | 每 10 次提交采样一次的逐 RenderPass GPU 时间、尺寸、格式、Load 行为、Draw 数；`boot.txt` 每约 300 帧另有热点 Top 5 汇总 |
-| `perf.txt` | 已有的性能 / 长帧上下文记录 |
+| `perf.txt` | 性能 / 长帧上下文记录；`# RUN START` 标记进程运行边界，`# PERF SEGMENT START` 标记文件轮转后的新段，避免把不同运行的进程秒数混在一起 |
 
-`passgpu.tsv` 稀疏采样后文件体积和 GPU 计时开销会比逐提交采样小。非采样提交不等待计时环，也不写 GPU 时间戳。仍然属于诊断模式，不应用该次数据评价最终帧率、温度或耗电。
+`passgpu.tsv` 稀疏采样后文件体积和 GPU 计时开销会比逐提交采样小。完整诊断还会仅在帧 6000–6100 启用详细 pass dump，写入 `boot.txt`，用同一帧的 `global pass` 将热点序号关联到具体附件 / Shader；`DM_NVN_PASSDUMP_ALL` 不开启。非采样提交不等待计时环，也不写 GPU 时间戳。仍然属于诊断模式，不应用该次数据评价最终帧率、温度或耗电。
 
 ## iPhone 上如何取文件
 

@@ -1799,7 +1799,7 @@ static void pg_commit(id fb) {   // 把本次提交的通道表交给完成回�
                     for (int j = 0; j < 5; j++) if (top[j] < 0 || m > g_pg_st[top[j]].sum / g_pg_st[top[j]].n) { for (int q = 4; q > j; q--) top[q] = top[q - 1]; top[j] = k; break; } }
                 char line[1024]; size_t o = 0;
                 for (int j = 0; j < 5 && top[j] >= 0; j++) { pg_stat *t = &g_pg_st[top[j]];
-                    o += snprintf(line + o, sizeof line - o, " #%d %.2f ms %dx%d fmt%u d%u %s %d 绘制；", top[j], t->sum / t->n, t->meta.w, t->meta.h, t->meta.cfmt0, t->meta.dfmt, t->meta.load, t->meta.draws); }
+                    o += snprintf(line + o, sizeof line - o, " idx#%d F%llu pass#%llu %.2f ms %dx%d fmt%u d%u %s %d 绘制 n=%llu；", top[j], (unsigned long long)t->meta.frame, (unsigned long long)t->meta.pass, t->sum / t->n, t->meta.w, t->meta.h, t->meta.cfmt0, t->meta.dfmt, t->meta.load, t->meta.draws, (unsigned long long)t->n); }
                 MLOG("[passgpu] 至帧 %llu 每帧通道均值合计 %.2f ms；前五：%s", (unsigned long long)p->frame, tot, line);
                 fflush(g_pg_f);
             }

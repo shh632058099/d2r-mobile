@@ -1,21 +1,21 @@
 // 内存账：DM_MEMSTAT=<tsv 路径> 时每秒记一行（Mac / iOS 通用）。
 //   总量：phys_footprint（task_info TASK_VM_INFO，iOS 内存上限按它算）、os_proc_available_memory（仅 iOS）、Metal currentAllocatedSize
 //   拆账：遍历本进程 VM 区（vm_region_recurse_64，VM_REGION_SUBMAP_INFO_64），按区归类，每类记
-//         虚拟 = 地址空间大小（只预留也算）、常驻 = pages_resident、计费 = 脏页 + 被压缩/换出页，按 VM 对象去重（≈ 进 phys_footprint 的部分）
-//         去重键 = (对象号, 对象内偏移)；去重原因：Metal 以「不复制」包住客体内存池，同一对象被多处映射（share_mode TRUESHARED、ref_count>1），逐区相加会重复计；
-// Mac 实测按对象去重后 Σ计费 2,139 MiB 对 phys_footprint 2,111 MiB（+1.3%）
+//         虚拟 = 地址空间大小（只预留也算）、常驻 = pages_resident、区域估算 = pages_dirtied + pages_swapped_out。
+//         当前仅按 (对象号, 区域起始页) 抑制完全相同起点的重复项；这不是按页范围并集，不能当作严格物理内存拆账，共享 / 重叠映射仍可能重复计数。
+//         因此区域估算合计可能高于 phys_footprint；差值为负表示估算偏差，不代表“负的未归属内存”。
 //   类别：guest（客体地址空间整块，含 SetHeapSize 的堆、alias、栈；RomFS 经 pread 读进的数据也落在这里）、code（内嵌 / 装载的模块映像）、
 //         malloc（宿主堆）、gpu（IOAccelerator / IOSurface / Metal 标签区）、stack、file（文件映射）、other
-//   计费 ≠ phys_footprint 的部分（IOKit 记账的 GPU 私有内存不在任何 VM 区里）单列为「未归属」= footprint − Σ计费。
+//   区域估算合计与 phys_footprint 不保证可加；footprint差值 = footprint − 区域估算合计，可正可负，不解释为「未归属」内存。
 // Memory accounting: when DM_MEMSTAT=<tsv path> is set, one line is logged per second (common to Mac / iOS).
 //   Totals: phys_footprint (task_info TASK_VM_INFO, which the iOS memory limit is based on), os_proc_available_memory (iOS only), Metal currentAllocatedSize
 //   Breakdown: walk this process's VM regions (vm_region_recurse_64, VM_REGION_SUBMAP_INFO_64), classify by region, and for each class record
-//         virtual = address space size (reserved-only counts too), resident = pages_resident, charged = dirty pages + compressed/swapped-out pages, deduplicated by VM object (≈ the part that goes into phys_footprint)
-//         dedup key = (object id, offset within the object); reason for dedup: Metal wraps the guest memory pool with "no copy", so the same object is mapped in several places (share_mode TRUESHARED, ref_count>1), and summing region by region would double count;
-// measured on Mac, after per-object dedup Σcharged is 2,139 MiB against phys_footprint 2,111 MiB (+1.3%)
+//         virtual = address space size, resident = pages_resident, region estimate = pages_dirtied + pages_swapped_out.
+//         Current suppression only catches duplicate (object id, region-start offset) keys; it is not a page-range union, so shared / overlapping mappings may still be counted more than once.
+//         The estimate sum can exceed phys_footprint; a negative delta indicates accounting-method error, not "negative unattributed memory".
 //   Classes: guest (the whole guest address space block, including the SetHeapSize heap, alias, stacks; data read from RomFS through pread also lands here), code (embedded / loaded module images),
 //         malloc (host heap), gpu (IOAccelerator / IOSurface / Metal tagged regions), stack, file (file mappings), other
-//   The part where charged ≠ phys_footprint (GPU private memory accounted by IOKit is not in any VM region) is listed separately as 「未归属」(unattributed) = footprint − Σcharged.
+//   Region-estimate sum and phys_footprint are not guaranteed to be additive; the signed footprint delta is not an "unattributed memory" measurement.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <TargetConditionals.h>
@@ -73,7 +73,7 @@ static void sample(FILE *f, double t, id<MTLDevice> dev) {
 #if TARGET_OS_IPHONE
     avail = os_proc_available_memory();
 #endif
-    uint64_t virt[NC] = {0}, res[NC] = {0}, bill[NC] = {0};
+    uint64_t virt[NC] = {0}, res[NC] = {0}, estimate[NC] = {0};
     static uint32_t seen[1 << 16]; static uint32_t gen; gen++; if (!gen) { memset(seen, 0, sizeof seen); gen = 1; }   // 本次采样已计对象（开放寻址） | Objects already counted in this sample (open addressing)
     vm_address_t a = 0; vm_size_t sz; natural_t depth = 0; vm_size_t pg = vm_page_size;
     for (;;) {
@@ -83,20 +83,20 @@ static void sample(FILE *f, double t, id<MTLDevice> dev) {
         int c = classify(a, &in);
         virt[c] += sz; res[c] += (uint64_t)in.pages_resident * pg;
         if (!in.external_pager) {                             // 文件页可回收，不进 footprint | File pages are reclaimable and do not count toward footprint
-            static uint64_t key[1 << 16];                     // 键 = (对象号, 对象内偏移)：同对象被 mprotect 切开的各段覆盖不同页，不能并 | Key = (object id, offset within the object): the pieces of one object split apart by mprotect cover different pages and must not be merged
-            uint64_t k = (uint64_t)in.object_id << 32 ^ (in.offset >> 14);
+            static uint64_t key[1 << 16];                     // 键 = (对象号, 区域起始页)；只抑制完全相同的起点，重叠但起点不同的范围无法精确去重 | Key = (object id, region-start page); only identical starts are suppressed, overlapping ranges with different starts are not exactly deduplicated
+            uint64_t k = (uint64_t)in.object_id << 32 ^ (in.offset / pg);
             uint32_t h = (uint32_t)((k * 0x9E3779B97F4A7C15ull) >> 48), dup = 0;
             while (seen[h] == gen) { if (key[h] == k) { dup = 1; break; } h = (h + 1) & 0xFFFF; }
-            if (!dup) { seen[h] = gen; key[h] = k; bill[c] += ((uint64_t)in.pages_dirtied + in.pages_swapped_out) * pg; }
+            if (!dup) { seen[h] = gen; key[h] = k; estimate[c] += ((uint64_t)in.pages_dirtied + in.pages_swapped_out) * pg; }
         }
         a += sz; continue;
     }
-    uint64_t sum = 0; for (int c = 0; c < NC; c++) sum += bill[c];
+    uint64_t estimate_sum = 0; for (int c = 0; c < NC; c++) estimate_sum += estimate[c];
     fprintf(f, "%.0f\t%llu\t%llu\t%llu\t%llu\t%llu\t%lld\t%lld", t, fp >> 20, avail >> 20, (unsigned long long)(dev.currentAllocatedSize >> 20),
             vi.internal >> 20, vi.compressed >> 20, (vi.ledger_tag_graphics_footprint + vi.ledger_tag_graphics_footprint_compressed) >> 20,
             (long long)(vi.limit_bytes_remaining >> 20));
-    for (int c = 0; c < NC; c++) fprintf(f, "\t%llu/%llu/%llu", virt[c] >> 20, res[c] >> 20, bill[c] >> 20);
-    fprintf(f, "\t%llu\t%lld\n", sum >> 20, ((int64_t)fp - (int64_t)sum) >> 20);
+    for (int c = 0; c < NC; c++) fprintf(f, "\t%llu/%llu/%llu", virt[c] >> 20, res[c] >> 20, estimate[c] >> 20);
+    fprintf(f, "\t%llu\t%lld\n", estimate_sum >> 20, ((int64_t)fp - (int64_t)estimate_sum) >> 20);
     fflush(f);
 }
 
@@ -110,9 +110,9 @@ static void *memstat_thread(void *p) {
     if (iv > 300) iv = 300;
     FILE *f = fopen(path, "w");
     if (!f) { LOG("memstat：打不开 %s", path); return NULL; }
-    fprintf(f, "# 单位 MiB；内核记账 internal / compressed / 图形 ledger / 距上限；类别列 = 虚拟/常驻/计费（按对象去重）；计费合计 = Σ私有计费；未归属 = phys_footprint − 计费合计\n秒\tphys_footprint\t可用\tmetal_alloc\tinternal\tcompressed\tgraphics\t距上限");
+    fprintf(f, "# 单位 MiB；internal/compressed/graphics/距上限为内核记账字段；类别列 = 虚拟/常驻/区域估算；区域估算合计可能因共享 / 重叠映射而重复计数；footprint差值 = phys_footprint − 区域估算合计（可为负，不代表未归属内存）\n秒\tphys_footprint\t可用\tmetal_alloc\tinternal\tcompressed\tgraphics\t距上限");
     for (int c = 0; c < NC; c++) fprintf(f, "\t%s", k_cls[c]);
-    fprintf(f, "\t计费合计\t未归属\n");
+    fprintf(f, "\t区域估算合计\tfootprint差值\n");
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();   // 与图形后端同一设备对象（系统缺省设备单例） | The same device object as the graphics backend (the system default device singleton)
     uint64_t t0 = now_ns();
     const char *ds = getenv("DM_MEMSTAT_DUMP"); int dump_at = ds ? atoi(ds) : -1;

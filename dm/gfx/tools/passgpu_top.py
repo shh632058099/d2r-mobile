@@ -17,7 +17,7 @@ except FileNotFoundError: pass
 c=[f for f in per if f in g]
 print('帧数 %d；每帧增量之和 p50 %.2f / p95 %.2f ms%s'%(len(per),S.median(per.values()),sorted(per.values())[int(len(per)*.95)],'；同帧 @gpu_ms p50 %.2f ms'%S.median(g[f] for f in c) if c else ''))
 tot=sum(S.mean(v) for v in inc.values())
-print('前列（帧内序号：增量均值 ms，占比 ｜ 尺寸 颜色格式 深度格式 读入 绘制数 种类）')
+print('前列（idx=帧内序号；最后样本的 F/global pass 可与同帧 DM_NVN_PASSDUMP 关联）')
 for k in sorted(inc,key=lambda k:-S.mean(inc[k]))[:N]:
-    r=meta[k]; m=S.mean(inc[k]); print('  #%d：%.3f ms %4.1f%% ｜ %sx%s fmt%s d%s %s %s 绘制 %s'%(k,m,100*m/tot,r[5],r[6],r[7],r[8],r[9],r[10],r[2]))
+    r=meta[k]; m=S.mean(inc[k]); print('  idx#%d：%.3f ms %4.1f%% ｜ 最后样本 F%s pass#%s n=%d ｜ %sx%s fmt%s d%s %s %s 绘制 %s'%(k,m,100*m/tot,r[0],r[13],len(inc[k]),r[5],r[6],r[7],r[8],r[9],r[10],r[2]))
 print('通道数 / 帧：%d；合计 %.2f ms'%(len(inc),tot))

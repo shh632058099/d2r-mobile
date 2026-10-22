@@ -708,6 +708,9 @@ static void boot_prepare(void) {
         plog("boot: 逐通道 GPU 诊断已开启，结果 passgpu.tsv；每 %s 次提交采样", fullDiagnostics ? "10" : "1");
     }
     if (fullDiagnostics) {
+        // 只在稳定高负载窗口采集详细附件 / Shader 关联，避免整局逐通道 dump 放大诊断开销。
+        setenv("DM_NVN_PASSDUMP", "6000-6100", 1);
+        plog("boot: RenderPass 详细关联诊断开启：仅帧 6000–6100 写入 boot.txt（DM_NVN_PASSDUMP_ALL 未开启）");
         NSString *frames = [doc stringByAppendingPathComponent:@"frames.tsv"];
         setenv("DM_NVN_TSV", frames.fileSystemRepresentation, 1);
         setenv("DM_NVN_TSV_CALLS", "0", 1);   // 只记逐帧指标，不写数百个函数计数，控制文件体积
@@ -741,6 +744,7 @@ static void boot_begin(void) {
 }
 static void *boot_thread(void *arg) {
     (void)arg;
+    pthread_setname_np("dm-game-main");
     g_T[5] = since_start();
     char **argv = g_boot_argv;
     { uint64_t r = front_game_res(1), r0 = front_game_res(0);   // 全屏验收④：与游戏建的交换链尺寸（WindowInitialize 行）对照 | Full-screen acceptance ④: compare with the swapchain size the game creates (the WindowInitialize line)
